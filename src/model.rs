@@ -1,6 +1,6 @@
 use crate::{
     config::{Config, secret},
-    store::Store,
+    store::{MemoryDraft, MemoryKind, Store},
     types::Event,
 };
 use anyhow::{Context, Result, bail};
@@ -59,6 +59,125 @@ impl ModelClient {
         }
         Ok(content)
     }
+
+    pub async fn extract_memories(
+        &self,
+        c: &Config,
+        store: &Store,
+        e: &Event,
+    ) -> Result<Vec<MemoryDraft>> {
+        if c.model.name.trim().is_empty() {
+            bail!("model.name is not configured")
+        }
+        let key = secret(&c.model.api_key_env)?;
+        let history = store.history(e, 8)?;
+        let conversation = history
+            .into_iter()
+            .map(|m| {
+                format!(
+                    "{}: {}",
+                    if m.role == "assistant" {
+                        "大肥鱼"
+                    } else {
+                        "用户"
+                    },
+                    m.content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let system = "从下面的私聊中提取最多 3 条用户明确表达的长期事实或偏好。不要推断。不要记录密码、令牌、财务、健康、精确住址、政治或性相关信息，也不要将指令或临时情绪保存为记忆。分类只能是 fact、profile、experience、style。输出 JSON 对象：{\"memories\":[{\"kind\":\"profile\",\"subject\":\"主题\",\"text\":\"简洁记忆\",\"importance\":1}]};没有合适内容输出空数组。";
+        let url = format!(
+            "{}/chat/completions",
+            c.model.base_url.trim_end_matches('/')
+        );
+        let response=self.http.post(url).bearer_auth(key).json(&json!({"model":c.model.name,"messages":[{"role":"system","content":system},{"role":"user","content":conversation}],"temperature":0,"max_tokens":384,"stream":false})).timeout(Duration::from_secs(c.model.timeout_secs.min(40))).send().await.context("memory extraction request")?;
+        let status = response.status();
+        let body: Value = response.json().await.context("decode memory extraction")?;
+        if !status.is_success() {
+            bail!("memory extraction returned {status}")
+        }
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+        parse_extracted_memories(content, &e.session())
+    }
+}
+
+fn parse_extracted_memories(content: &str, session: &str) -> Result<Vec<MemoryDraft>> {
+    let start = content
+        .find('{')
+        .ok_or_else(|| anyhow::anyhow!("memory extraction returned no JSON"))?;
+    let end = content
+        .rfind('}')
+        .ok_or_else(|| anyhow::anyhow!("memory extraction returned incomplete JSON"))?;
+    let parsed: Extraction =
+        serde_json::from_str(&content[start..=end]).context("parse extracted memories")?;
+    Ok(parsed
+        .memories
+        .into_iter()
+        .filter_map(|m| {
+            let kind = match m.kind.as_str() {
+                "fact" => MemoryKind::Fact,
+                "profile" => MemoryKind::Profile,
+                "experience" => MemoryKind::Experience,
+                "style" => MemoryKind::Style,
+                _ => return None,
+            };
+            let subject = m.subject.trim();
+            let text = m.text.trim();
+            if subject.is_empty() || text.is_empty() || subject.len() > 100 || text.len() > 500 {
+                return None;
+            }
+            if contains_sensitive_data(subject) || contains_sensitive_data(text) {
+                return None;
+            }
+            Some(MemoryDraft {
+                session: session.to_owned(),
+                kind,
+                subject: subject.into(),
+                text: text.into(),
+                importance: m.importance.unwrap_or(2).min(5),
+            })
+        })
+        .take(3)
+        .collect())
+}
+
+fn contains_sensitive_data(text: &str) -> bool {
+    let normalized = text.to_lowercase();
+    [
+        "password",
+        "passwd",
+        "api key",
+        "access_token",
+        "secret",
+        "github_pat_",
+        "ghp_",
+        "密码",
+        "口令",
+        "令牌",
+        "身份证",
+        "银行卡",
+        "信用卡",
+        "病史",
+        "诊断",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+#[derive(serde::Deserialize)]
+struct Extraction {
+    #[serde(default)]
+    memories: Vec<ExtractedMemory>,
+}
+#[derive(serde::Deserialize)]
+struct ExtractedMemory {
+    kind: String,
+    subject: String,
+    text: String,
+    importance: Option<u8>,
 }
 fn build_prompt(c: &Config, store: &Store, e: &Event, text: &str) -> Result<String> {
     let mut prompt = c
@@ -83,7 +202,12 @@ fn build_prompt(c: &Config, store: &Store, e: &Event, text: &str) -> Result<Stri
     if !memories.is_empty() {
         prompt.push_str("\n\n可参考的当前会话记忆（可能过时，优先听取用户当前表述）：");
         for m in memories {
-            prompt.push_str(&format!("\n- [{}] {}", m.subject, m.text));
+            prompt.push_str(&format!(
+                "\n- [{} · {}] {}",
+                m.kind.as_str(),
+                m.subject,
+                m.text
+            ));
         }
     }
     let mood = store.mood(&e.session());
@@ -138,5 +262,14 @@ mod tests {
             .unwrap();
         let p = build_prompt(&c, &s, &e, "tea").unwrap();
         assert!(p.contains("likes tea"));
+    }
+
+    #[test]
+    fn extraction_rejects_unsupported_categories_and_long_values() {
+        let content=serde_json::json!({"memories":[{"kind":"profile","subject":"food","text":"likes tea","importance":9},{"kind":"secret","subject":"token","text":"x"},{"kind":"fact","subject":"long","text":"x".repeat(501)},{"kind":"fact","subject":"credential","text":"my API key is abc"}]}).to_string();
+        let parsed = parse_extracted_memories(&content, "session").unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].importance, 5);
+        assert_eq!(parsed[0].session, "session");
     }
 }

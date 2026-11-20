@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -24,10 +25,39 @@ pub struct Message {
 pub struct Memory {
     pub id: i64,
     pub session: String,
+    pub kind: MemoryKind,
     pub subject: String,
     pub text: String,
     pub importance: u8,
     pub updated_at: i64,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryKind {
+    Fact,
+    Profile,
+    Experience,
+    Style,
+}
+
+impl MemoryKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fact => "fact",
+            Self::Profile => "profile",
+            Self::Experience => "experience",
+            Self::Style => "style",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryDraft {
+    pub session: String,
+    pub kind: MemoryKind,
+    pub subject: String,
+    pub text: String,
+    pub importance: u8,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Session {
@@ -68,7 +98,7 @@ impl Store {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
         CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY,session TEXT NOT NULL,role TEXT NOT NULL,sender TEXT NOT NULL,content TEXT NOT NULL,created_at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS messages_session ON messages(session,id DESC);
-        CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY,session TEXT NOT NULL,subject TEXT NOT NULL,text TEXT NOT NULL,importance INTEGER NOT NULL DEFAULT 2,updated_at INTEGER NOT NULL, UNIQUE(session,subject,text));
+        CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY,session TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'fact',subject TEXT NOT NULL,text TEXT NOT NULL,importance INTEGER NOT NULL DEFAULT 2,updated_at INTEGER NOT NULL, UNIQUE(session,subject,text));
         CREATE INDEX IF NOT EXISTS memories_session ON memories(session,updated_at DESC);
         CREATE TABLE IF NOT EXISTS traces(id INTEGER PRIMARY KEY,session TEXT NOT NULL,kind TEXT NOT NULL,detail TEXT NOT NULL,created_at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS traces_created ON traces(created_at DESC);
@@ -81,6 +111,12 @@ impl Store {
         CREATE TABLE IF NOT EXISTS received_events(event_key TEXT PRIMARY KEY,created_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS moods(session TEXT PRIMARY KEY,value REAL NOT NULL,updated_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS rate_limits(session TEXT NOT NULL,sender TEXT NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(session,sender));")?;
+        if !has_column(&db, "memories", "kind")? {
+            db.execute(
+                "ALTER TABLE memories ADD COLUMN kind TEXT NOT NULL DEFAULT 'fact'",
+                [],
+            )?;
+        }
         Ok(Self(Arc::new(Mutex::new(db))))
     }
     pub fn backup(&self) -> Result<Vec<u8>> {
@@ -101,6 +137,12 @@ impl Store {
             std::time::Duration::from_millis(20),
             None,
         )?;
+        if !has_column(&target, "memories", "kind")? {
+            target.execute(
+                "ALTER TABLE memories ADD COLUMN kind TEXT NOT NULL DEFAULT 'fact'",
+                [],
+            )?;
+        }
         Ok(())
     }
     fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -139,9 +181,38 @@ impl Store {
         importance: u8,
         limit: usize,
     ) -> Result<()> {
-        let db = self.db();
-        db.execute("INSERT INTO memories(session,subject,text,importance,updated_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(session,subject,text) DO UPDATE SET importance=max(importance,excluded.importance),updated_at=excluded.updated_at",params![session,truncate(subject,100),truncate(text,1000),importance.min(5),now()])?;
-        db.execute("DELETE FROM memories WHERE session=?1 AND id NOT IN (SELECT id FROM memories WHERE session=?1 ORDER BY importance DESC,updated_at DESC LIMIT ?2)",params![session,limit.max(1) as i64])?;
+        self.add_typed_memory(session, MemoryKind::Fact, subject, text, importance, limit)
+    }
+    pub fn add_typed_memory(
+        &self,
+        session: &str,
+        kind: MemoryKind,
+        subject: &str,
+        text: &str,
+        importance: u8,
+        limit: usize,
+    ) -> Result<()> {
+        let draft = MemoryDraft {
+            session: session.into(),
+            kind,
+            subject: subject.into(),
+            text: text.into(),
+            importance,
+        };
+        self.add_memories(std::slice::from_ref(&draft), limit)
+    }
+    pub fn add_memories(&self, drafts: &[MemoryDraft], limit: usize) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let mut sessions = HashSet::new();
+        for draft in drafts {
+            tx.execute("INSERT INTO memories(session,kind,subject,text,importance,updated_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session,subject,text) DO UPDATE SET kind=excluded.kind,importance=max(importance,excluded.importance),updated_at=excluded.updated_at",params![draft.session,draft.kind.as_str(),truncate(&draft.subject,100),truncate(&draft.text,1000),draft.importance.min(5),now()])?;
+            sessions.insert(draft.session.as_str());
+        }
+        for session in sessions {
+            tx.execute("DELETE FROM memories WHERE session=?1 AND id NOT IN (SELECT id FROM memories WHERE session=?1 ORDER BY importance DESC,updated_at DESC LIMIT ?2)",params![session,limit.max(1) as i64])?;
+        }
+        tx.commit()?;
         Ok(())
     }
     pub fn recall(
@@ -153,7 +224,7 @@ impl Store {
     ) -> Result<Vec<Memory>> {
         let db = self.db();
         let shared = if include_shared { "*" } else { "" };
-        let mut stmt=db.prepare("SELECT id,session,subject,text,importance,updated_at FROM memories WHERE session=?1 OR session=?2 ORDER BY importance DESC,updated_at DESC LIMIT ?3")?;
+        let mut stmt=db.prepare("SELECT id,session,kind,subject,text,importance,updated_at FROM memories WHERE session=?1 OR session=?2 ORDER BY importance DESC,updated_at DESC LIMIT ?3")?;
         let rows = stmt
             .query_map(
                 params![e.session(), shared, limit.clamp(1, 20) as i64],
@@ -161,10 +232,11 @@ impl Store {
                     Ok(Memory {
                         id: r.get(0)?,
                         session: r.get(1)?,
-                        subject: r.get(2)?,
-                        text: r.get(3)?,
-                        importance: r.get(4)?,
-                        updated_at: r.get(5)?,
+                        kind: memory_kind(&r.get::<_, String>(2)?),
+                        subject: r.get(3)?,
+                        text: r.get(4)?,
+                        importance: r.get(5)?,
+                        updated_at: r.get(6)?,
                     })
                 },
             )?
@@ -196,23 +268,38 @@ impl Store {
             .map(|x| x.1)
             .collect())
     }
-    pub fn memories(&self, session: &str, limit: usize, offset: usize) -> Result<Vec<Memory>> {
+    pub fn memories(
+        &self,
+        session: &str,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Memory>> {
         let db = self.db();
-        let mut q=db.prepare("SELECT id,session,subject,text,importance,updated_at FROM memories WHERE session=?1 OR ?1='*' ORDER BY importance DESC,updated_at DESC LIMIT ?2 OFFSET ?3")?;
+        let mut q=db.prepare("SELECT id,session,kind,subject,text,importance,updated_at FROM memories WHERE (session=?1 OR ?1='*') AND (?2='' OR instr(lower(subject||' '||text),lower(?2))>0) ORDER BY importance DESC,updated_at DESC LIMIT ?3 OFFSET ?4")?;
         Ok(q.query_map(
-            params![session, limit.clamp(1, 500) as i64, offset as i64],
+            params![
+                session,
+                truncate(query, 100),
+                limit.clamp(1, 500) as i64,
+                offset as i64
+            ],
             |r| {
                 Ok(Memory {
                     id: r.get(0)?,
                     session: r.get(1)?,
-                    subject: r.get(2)?,
-                    text: r.get(3)?,
-                    importance: r.get(4)?,
-                    updated_at: r.get(5)?,
+                    kind: memory_kind(&r.get::<_, String>(2)?),
+                    subject: r.get(3)?,
+                    text: r.get(4)?,
+                    importance: r.get(5)?,
+                    updated_at: r.get(6)?,
                 })
             },
         )?
         .collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn update_memory(&self, id: i64, draft: &MemoryDraft) -> Result<bool> {
+        Ok(self.db().execute("UPDATE memories SET kind=?2,subject=?3,text=?4,importance=?5,updated_at=?6 WHERE id=?1",params![id,draft.kind.as_str(),truncate(&draft.subject,100),truncate(&draft.text,1000),draft.importance.min(5),now()])?==1)
     }
     pub fn delete_memory(&self, id: i64) -> Result<bool> {
         Ok(self
@@ -457,6 +544,25 @@ impl Store {
     }
 }
 
+fn has_column(db: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = db.prepare(&format!("PRAGMA table_info({table})"))?;
+    for name in stmt.query_map([], |row| row.get::<_, String>(1))? {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn memory_kind(kind: &str) -> MemoryKind {
+    match kind {
+        "profile" => MemoryKind::Profile,
+        "experience" => MemoryKind::Experience,
+        "style" => MemoryKind::Style,
+        _ => MemoryKind::Fact,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,7 +594,49 @@ mod tests {
             s.add_memory("x", "fact", &format!("fact{i}"), 1, 3)
                 .unwrap();
         }
-        assert_eq!(s.memories("x", 100, 0).unwrap().len(), 3);
+        assert_eq!(s.memories("x", "", 100, 0).unwrap().len(), 3);
+    }
+    #[test]
+    fn upgrades_old_memory_tables_without_losing_rows() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Connection::open(file.path()).unwrap();
+        db.execute_batch("CREATE TABLE memories(id INTEGER PRIMARY KEY,session TEXT NOT NULL,subject TEXT NOT NULL,text TEXT NOT NULL,importance INTEGER NOT NULL DEFAULT 2,updated_at INTEGER NOT NULL,UNIQUE(session,subject,text)); INSERT INTO memories(session,subject,text,importance,updated_at) VALUES('s','p','likes tea',2,1);")
+            .unwrap();
+        drop(db);
+        let store = Store::open(file.path()).unwrap();
+        let rows = store.memories("s", "tea", 10, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, MemoryKind::Fact);
+    }
+    #[test]
+    fn restoring_an_old_database_migrates_memory_rows() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let old = Connection::open(file.path()).unwrap();
+        old.execute_batch("CREATE TABLE memories(id INTEGER PRIMARY KEY,session TEXT NOT NULL,subject TEXT NOT NULL,text TEXT NOT NULL,importance INTEGER NOT NULL DEFAULT 2,updated_at INTEGER NOT NULL,UNIQUE(session,subject,text)); INSERT INTO memories(session,subject,text,importance,updated_at) VALUES('s','p','likes tea',2,1);")
+            .unwrap();
+        drop(old);
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store.restore(file.path()).unwrap();
+        let rows = store.memories("s", "", 10, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, MemoryKind::Fact);
+    }
+    #[test]
+    fn memory_categories_and_search_are_persisted() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store
+            .add_typed_memory(
+                "s",
+                MemoryKind::Style,
+                "owner",
+                "likes short answers",
+                3,
+                10,
+            )
+            .unwrap();
+        let rows = store.memories("s", "short", 10, 0).unwrap();
+        assert_eq!(rows[0].kind, MemoryKind::Style);
+        assert_eq!(store.memories("s", "absent", 10, 0).unwrap().len(), 0);
     }
     #[test]
     fn cooldown_is_per_sender_and_session() {

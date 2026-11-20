@@ -2,7 +2,7 @@ use crate::{
     adapters::official,
     config::Config,
     engine::Engine,
-    store::{Settings, Store},
+    store::{MemoryDraft, MemoryKind, Settings, Store},
     types::now,
 };
 use axum::{
@@ -12,7 +12,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{get, post, put},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -40,16 +40,23 @@ pub struct MemoryQuery {
     session: String,
     #[serde(default)]
     offset: usize,
+    #[serde(default)]
+    q: String,
     #[serde(default = "default_limit")]
     limit: usize,
 }
 #[derive(Deserialize)]
 pub struct MemoryInput {
     session: String,
+    #[serde(default = "default_memory_kind")]
+    kind: MemoryKind,
     subject: String,
     text: String,
     #[serde(default = "default_importance")]
     importance: u8,
+}
+fn default_memory_kind() -> MemoryKind {
+    MemoryKind::Fact
 }
 fn default_importance() -> u8 {
     2
@@ -88,7 +95,11 @@ pub fn router(engine: Engine, cfg: Arc<Config>, token: &str) -> Router {
             get(get_persona).put(set_persona),
         )
         .route("/api/memories", get(memories).post(add_memory))
-        .route("/api/memories/{id}", delete(delete_memory))
+        .route("/api/memories/import", post(import_memories))
+        .route(
+            "/api/memories/{id}",
+            put(update_memory).delete(delete_memory),
+        )
         .route("/api/stickers", get(stickers))
         .route(
             "/api/stickers/{id}",
@@ -211,7 +222,7 @@ async fn put_settings(
     if v.persona.len() > 50
         || !(1..=100).contains(&v.context_messages)
         || !["mention", "keyword", "all"].contains(&v.group_mode.as_str())
-        || !(1..=24).contains(&v.memory_limit)
+        || !(1..=100_000).contains(&v.memory_limit)
         || v.memory_recall > 20
         || v.awake_start > 23
         || !(1..=24).contains(&v.awake_end)
@@ -286,29 +297,73 @@ async fn memories(
     Query(q): Query<MemoryQuery>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!(
-        s.store.memories(&q.session, q.limit, q.offset)?
+        s.store.memories(&q.session, &q.q, q.limit, q.offset)?
     )))
 }
 async fn add_memory(
     State(s): State<AppState>,
     Json(v): Json<MemoryInput>,
 ) -> Result<Json<Value>, ApiError> {
-    if v.session.len() > 512
-        || v.text.trim().is_empty()
-        || v.text.len() > 2000
-        || v.subject.len() > 100
-        || v.importance > 5
-    {
+    if v.session.len() > 512 || !valid_memory(&v) {
         return Err(ApiError::bad("invalid memory"));
     }
-    s.store.add_memory(
+    s.store.add_typed_memory(
         &v.session,
+        v.kind,
         &v.subject,
         &v.text,
         v.importance,
         s.cfg.chat.memory_limit,
     )?;
     Ok(Json(json!({"ok":true})))
+}
+async fn update_memory(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(v): Json<MemoryInput>,
+) -> Result<Json<Value>, ApiError> {
+    if !valid_memory(&v) {
+        return Err(ApiError::bad("invalid memory"));
+    }
+    let draft = MemoryDraft {
+        session: v.session,
+        kind: v.kind,
+        subject: v.subject,
+        text: v.text,
+        importance: v.importance,
+    };
+    Ok(Json(json!({"updated":s.store.update_memory(id,&draft)?})))
+}
+async fn import_memories(
+    State(s): State<AppState>,
+    Json(values): Json<Vec<MemoryInput>>,
+) -> Result<Json<Value>, ApiError> {
+    if values.len() > 500 || values.iter().any(|v| !valid_memory(v)) {
+        return Err(ApiError::bad(
+            "archive must contain at most 500 valid memories",
+        ));
+    }
+    let drafts: Vec<_> = values
+        .into_iter()
+        .map(|v| MemoryDraft {
+            session: v.session,
+            kind: v.kind,
+            subject: v.subject,
+            text: v.text,
+            importance: v.importance,
+        })
+        .collect();
+    let count = drafts.len();
+    s.store.add_memories(&drafts, s.cfg.chat.memory_limit)?;
+    Ok(Json(json!({"imported":count})))
+}
+fn valid_memory(v: &MemoryInput) -> bool {
+    !v.session.is_empty()
+        && v.session.len() <= 512
+        && !v.text.trim().is_empty()
+        && v.text.len() <= 2000
+        && v.subject.len() <= 100
+        && v.importance <= 5
 }
 async fn delete_memory(
     State(s): State<AppState>,
@@ -466,5 +521,46 @@ mod tests {
             .to_bytes();
         let settings: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(settings["group_mode"], "mention");
+    }
+
+    #[tokio::test]
+    async fn memory_api_searches_edits_and_imports_categories() {
+        let cfg = Arc::new(Config::default());
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let engine = Engine::new(cfg.clone(), store).unwrap();
+        let app = router(engine, cfg, "a sufficiently long test token value");
+        let auth = "Bearer a sufficiently long test token value";
+        let response = app.clone().oneshot(Request::builder().method("POST").uri("/api/memories").header(axum::http::header::AUTHORIZATION,auth).header(axum::http::header::CONTENT_TYPE,"application/json").body(Body::from(r#"{"session":"*","kind":"profile","subject":"food","text":"likes tea","importance":3}"#)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memories?session=*&q=tea")
+                    .header(axum::http::header::AUTHORIZATION, auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let found: Value = serde_json::from_slice(&bytes).unwrap();
+        let id = found[0]["id"].as_i64().unwrap();
+        assert_eq!(found[0]["kind"], "profile");
+        let response = app.clone().oneshot(Request::builder().method("PUT").uri(format!("/api/memories/{id}")).header(axum::http::header::AUTHORIZATION,auth).header(axum::http::header::CONTENT_TYPE,"application/json").body(Body::from(r#"{"session":"*","kind":"style","subject":"answers","text":"prefers brief replies","importance":4}"#)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.oneshot(Request::builder().method("POST").uri("/api/memories/import").header(axum::http::header::AUTHORIZATION,auth).header(axum::http::header::CONTENT_TYPE,"application/json").body(Body::from(r#"[{"session":"*","kind":"experience","subject":"conversation","text":"enjoys discussing music","importance":2}]"#)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["imported"],
+            1
+        );
     }
 }

@@ -55,13 +55,14 @@ Official QQ account IDs are opaque platform identifiers. They are kept separate 
 - Keep `chat.enabled = false` and `chat.dry_run = true` until the model, channel, permissions and reply style are checked in the panel.
 - Set `chat.owners` to stable platform user IDs before enabling owner commands. OneBot uses QQ IDs. The official bot uses the platform's openid; it is not a QQ number.
 - Group replies default to explicit mention. Memory and history are scoped to a channel and conversation. The shared `/remember` memory is inserted only in owner sessions.
+- In private conversations, `chat.auto_memory` runs a bounded background extraction after replies. Extracted facts stay in that private session; owner memories are shared only with owner private chats. The extractor is instructed to reject credentials and sensitive topics. Turn this off in the panel if you do not want a second model request for memory.
 - Management requests use a bearer token. Store it in a secret manager as `AURABOT_ADMIN_TOKEN`; otherwise the generated token is stored in `data/admin.token`.
 - The HTTP/model queues, context length, response size, media size, history retention and memory store are bounded. SQLite uses WAL and a periodic cleanup command is available in the System page.
 - Run `cargo test` before release. End-to-end tests with a live QQ sandbox are still required for each official scene and media path.
 
 ## Planned capability set
 
-The target includes chat and interruption controls, independent personalities and mood, voice messages in both directions, emoji collection/use, long-term memory and person profiles, optional desktop pet, proactive private conversation, fine-grained permissions, and a full management panel. QQ Space, Bilibili, image generation and its arbitrary local endpoints, and the module marketplace are out of scope. This first pass establishes the service, account adapters, data store and basic panel; the remaining feature work must be verified against the legacy behavior before calling the rewrite complete.
+The target includes chat and interruption controls, independent personalities and mood, voice messages in both directions, emoji collection/use, long-term memory and person profiles, optional desktop pet, proactive private conversation, fine-grained permissions, and a full management panel. QQ Space, Bilibili, image generation and its arbitrary local endpoints, and the module marketplace are out of scope. Memory supports typed facts, profiles, relationship experience and speaking style, with search, edit, JSON import/export and private-chat extraction. The desktop pet and deeper behavior parity still need work and real QQ sandbox validation.
 
 ## License
 

@@ -298,6 +298,55 @@ impl Engine {
         self.store
             .record(&e, &e.text, &reply, settings.context_messages)?;
         self.store.trace(&e.session(), "reply", &reply);
+        if settings.auto_memory && e.is_private() && !e.proactive {
+            let engine = self.clone();
+            let event = e.clone();
+            if let Ok(permit) = self.permit.clone().try_acquire_owned() {
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    match engine
+                        .model
+                        .extract_memories(&engine.cfg, &engine.store, &event)
+                        .await
+                    {
+                        Ok(mut memories) if !memories.is_empty() => {
+                            let owner = engine.cfg.chat.owners.iter().any(|id| id == &event.sender);
+                            if owner {
+                                for memory in &mut memories {
+                                    memory.session = "*".into();
+                                }
+                            }
+                            let count = memories.len();
+                            if let Err(err) = engine
+                                .store
+                                .add_memories(&memories, engine.cfg.chat.memory_limit)
+                            {
+                                engine.store.trace(
+                                    &event.session(),
+                                    "memory_error",
+                                    &err.to_string(),
+                                );
+                            } else {
+                                engine.store.trace(
+                                    &event.session(),
+                                    "memory_saved",
+                                    &format!("saved {count} memories"),
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            engine
+                                .store
+                                .trace(&event.session(), "memory_error", &err.to_string())
+                        }
+                    }
+                });
+            } else {
+                self.store
+                    .trace(&e.session(), "memory_skipped", "model is busy");
+            }
+        }
         let (reply, sticker) = extract_sticker(&reply);
         if let Some(id) = sticker {
             if self.send_sticker(&e, id).await.is_err() {
