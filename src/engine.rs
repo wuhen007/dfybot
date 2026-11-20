@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
-    model::ModelClient,
-    store::{Settings, Store},
+    model::{ModelClient, ToolCall},
+    store::{MemoryKind, Settings, Store},
     types::{Channel, Event, Scene, now, truncate},
     voice::VoiceClient,
 };
@@ -286,7 +286,7 @@ impl Engine {
         let _p = self.permit.clone().acquire_owned().await?;
         let reply = tokio::time::timeout(
             Duration::from_secs(self.cfg.model.timeout_secs + 5),
-            self.model.reply(&self.cfg, &self.store, &e, &e.text),
+            self.generate_reply(&e, &settings),
         )
         .await
         .map_err(|_| anyhow::anyhow!("model response timed out"))??;
@@ -375,6 +375,146 @@ impl Engine {
             first = false;
         }
         Ok(())
+    }
+    async fn generate_reply(&self, e: &Event, settings: &Settings) -> Result<String> {
+        let mut messages = self
+            .model
+            .conversation(&self.cfg, &self.store, e, &e.text)?;
+        let owner = self.cfg.chat.owners.iter().any(|id| id == &e.sender);
+        let allow_remember = !settings.dry_run
+            && Store::permission_allowed(self.cfg.chat.memory_permission, owner, e.is_private());
+        let tools = ModelClient::tool_schemas(
+            allow_remember,
+            owner && e.is_private(),
+            self.cfg.chat.stickers,
+        );
+        for round in 0..3 {
+            let completion = self.model.complete(&self.cfg, &messages, &tools).await?;
+            if completion.calls.is_empty() {
+                return Ok(completion.text);
+            }
+            if round == 2 {
+                bail!("model exceeded the tool round limit")
+            }
+            messages.push(completion.assistant_message);
+            for call in completion.calls {
+                let result = self.execute_tool(e, settings, owner, &call).await;
+                match result {
+                    Ok(value) => {
+                        self.store.trace(&e.session(), "tool", &call.name);
+                        messages.push(serde_json::json!({"role":"tool","tool_call_id":call.id,"content":value}));
+                    }
+                    Err(err) => {
+                        self.store.trace(&e.session(), "tool_denied", &call.name);
+                        messages.push(serde_json::json!({"role":"tool","tool_call_id":call.id,"content":err.to_string()}));
+                    }
+                }
+            }
+        }
+        bail!("model did not return a final response")
+    }
+    async fn execute_tool(
+        &self,
+        e: &Event,
+        settings: &Settings,
+        owner: bool,
+        call: &ToolCall,
+    ) -> Result<String> {
+        let args = &call.arguments;
+        let output = match call.name.as_str() {
+            "search_memory" => {
+                let query = args["query"].as_str().unwrap_or("");
+                serde_json::to_string(&self.store.recall(
+                    e,
+                    query,
+                    settings.memory_recall,
+                    owner && e.is_private(),
+                )?)?
+            }
+            "remember" => {
+                if settings.dry_run
+                    || !Store::permission_allowed(
+                        self.cfg.chat.memory_permission,
+                        owner,
+                        e.is_private(),
+                    )
+                {
+                    bail!("memory writes are not allowed in this conversation")
+                }
+                let kind = match args["kind"].as_str().unwrap_or("fact") {
+                    "fact" => MemoryKind::Fact,
+                    "profile" => MemoryKind::Profile,
+                    "experience" => MemoryKind::Experience,
+                    "style" => MemoryKind::Style,
+                    _ => bail!("unknown memory category"),
+                };
+                let subject = args["subject"].as_str().unwrap_or("").trim();
+                let text = args["text"].as_str().unwrap_or("").trim();
+                if subject.is_empty() || subject.len() > 100 || text.is_empty() || text.len() > 500
+                {
+                    bail!("memory fields are empty or too long")
+                }
+                let scope = if owner
+                    && e.is_private()
+                    && self.cfg.chat.memory_permission == crate::config::Permission::OwnerPrivate
+                {
+                    "*".to_owned()
+                } else {
+                    e.session()
+                };
+                self.store.add_typed_memory(
+                    &scope,
+                    kind,
+                    subject,
+                    text,
+                    args["importance"].as_u64().unwrap_or(2).min(5) as u8,
+                    settings.memory_limit,
+                )?;
+                "记忆已保存".to_owned()
+            }
+            "search_stickers" => {
+                if !self.cfg.chat.stickers {
+                    bail!("stickers are disabled")
+                }
+                let rows = self
+                    .store
+                    .sticker_matches(args["query"].as_str().unwrap_or(""), 8)?;
+                let safe: Vec<_> = rows
+                    .into_iter()
+                    .map(|row| {
+                        serde_json::json!({"id":row["id"],"name":row["name"],"tags":row["tags"]})
+                    })
+                    .collect();
+                serde_json::to_string(&safe)?
+            }
+            "send_sticker" => {
+                if !self.cfg.chat.stickers || settings.dry_run {
+                    bail!("sticker sending is disabled")
+                }
+                let id = args["id"]
+                    .as_i64()
+                    .ok_or_else(|| anyhow::anyhow!("sticker id is required"))?;
+                self.send_sticker(e, id).await?;
+                "表情包已发送".to_owned()
+            }
+            "set_persona" => {
+                if settings.dry_run || !owner || !e.is_private() {
+                    bail!("persona changes require an owner private conversation")
+                }
+                let name = args["name"].as_str().unwrap_or("").trim();
+                if !self
+                    .store
+                    .personas(&self.cfg.chat.personas)?
+                    .contains_key(name)
+                {
+                    bail!("unknown persona")
+                }
+                self.store.set_session_persona(&e.session(), Some(name))?;
+                "人格已切换，下一轮生效".to_owned()
+            }
+            _ => bail!("unknown tool"),
+        };
+        Ok(output)
     }
     async fn prepare_text(&self, e: &Event) -> Result<String> {
         let mut text = e.text.clone();

@@ -64,6 +64,10 @@ Official QQ account IDs are opaque platform identifiers. They are kept separate 
 
 The target includes chat and interruption controls, independent personalities and mood, voice messages in both directions, emoji collection/use, long-term memory and person profiles, optional desktop pet, proactive private conversation, fine-grained permissions, and a full management panel. QQ Space, Bilibili, image generation and its arbitrary local endpoints, and the module marketplace are out of scope. Memory supports typed facts, profiles, relationship experience and speaking style, with search, edit, JSON import/export and private-chat extraction. The desktop pet and deeper behavior parity still need work and real QQ sandbox validation.
 
+## Built-in tools
+
+The model can search conversation-scoped memories and stickers. It may save a memory only where the configured memory permission allows it; owner-private memory is shared only with owner private conversations. Persona switching is owner-private only. Sticker sending follows the existing channel and dry-run behavior. The server does not execute model-supplied shell commands, arbitrary HTTP requests, or downloaded plugins.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

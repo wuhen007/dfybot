@@ -12,6 +12,20 @@ use std::time::Duration;
 pub struct ModelClient {
     http: Client,
 }
+
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+pub struct Completion {
+    pub text: String,
+    pub calls: Vec<ToolCall>,
+    pub assistant_message: Value,
+}
+
 impl ModelClient {
     pub fn new() -> Result<Self> {
         Ok(Self {
@@ -21,24 +35,70 @@ impl ModelClient {
                 .build()?,
         })
     }
-    pub async fn reply(&self, c: &Config, store: &Store, e: &Event, text: &str) -> Result<String> {
+    pub fn conversation(
+        &self,
+        c: &Config,
+        store: &Store,
+        e: &Event,
+        text: &str,
+    ) -> Result<Vec<Value>> {
+        let mut messages = vec![json!({"role":"system","content":build_prompt(c,store,e,text)?})];
+        for m in store.history(e, c.chat.context_messages)? {
+            messages.push(json!({"role":m.role,"content":m.content}));
+        }
+        messages.push(json!({"role":"user","content":text}));
+        Ok(messages)
+    }
+
+    pub async fn complete(
+        &self,
+        c: &Config,
+        messages: &[Value],
+        tools: &[Value],
+    ) -> Result<Completion> {
         if c.model.name.trim().is_empty() {
             bail!("model.name is not configured")
         };
         let key = secret(&c.model.api_key_env)?;
-        let mut msgs = vec![json!({"role":"system","content":build_prompt(c,store,e,text)?})];
-        for m in store.history(e, c.chat.context_messages)? {
-            msgs.push(json!({"role":m.role,"content":format!("{}",m.content)}));
-        }
-        if msgs.len() == 1 || !matches!(msgs.last().and_then(|v| v["role"].as_str()), Some("user"))
-        {
-            msgs.push(json!({"role":"user","content":text}));
-        }
         let url = format!(
             "{}/chat/completions",
             c.model.base_url.trim_end_matches('/')
         );
-        let res=self.http.post(url).bearer_auth(key).json(&json!({"model":c.model.name,"messages":msgs,"temperature":c.model.temperature,"max_tokens":c.model.max_tokens,"stream":false})).timeout(Duration::from_secs(c.model.timeout_secs)).send().await.context("model request")?;
+        let mut request = json!({"model":c.model.name,"messages":messages,"temperature":c.model.temperature,"max_tokens":c.model.max_tokens,"stream":false});
+        if !tools.is_empty() {
+            request["tools"] = Value::Array(tools.to_vec());
+            request["tool_choice"] = json!("auto");
+        }
+        let mut res = self
+            .http
+            .post(&url)
+            .bearer_auth(&key)
+            .json(&request)
+            .timeout(Duration::from_secs(c.model.timeout_secs))
+            .send()
+            .await
+            .context("model request")?;
+        if !tools.is_empty()
+            && matches!(
+                res.status(),
+                reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            )
+        {
+            let mut fallback = request;
+            if let Some(body) = fallback.as_object_mut() {
+                body.remove("tools");
+                body.remove("tool_choice");
+            }
+            res = self
+                .http
+                .post(&url)
+                .bearer_auth(&key)
+                .json(&fallback)
+                .timeout(Duration::from_secs(c.model.timeout_secs))
+                .send()
+                .await
+                .context("model request without tools")?;
+        }
         let status = res.status();
         let body: Value = res.json().await.context("decode model response")?;
         if !status.is_success() {
@@ -49,15 +109,65 @@ impl ModelClient {
                     .unwrap_or("request failed")
             );
         }
-        let content = body["choices"][0]["message"]["content"]
+        let assistant_message = body["choices"][0]["message"].clone();
+        let content = assistant_message["content"]
             .as_str()
             .unwrap_or("")
             .trim()
             .to_owned();
-        if content.is_empty() {
+        let mut calls = Vec::new();
+        if let Some(raw_calls) = assistant_message["tool_calls"].as_array() {
+            if raw_calls.len() > 4 {
+                bail!("model requested too many tools in one response");
+            }
+            for raw in raw_calls.iter().take(5) {
+                let arguments = match raw["function"]["arguments"].as_str() {
+                    Some(s) => serde_json::from_str(s).context("parse tool arguments")?,
+                    None => raw["function"]["arguments"].clone(),
+                };
+                if !arguments.is_object() {
+                    bail!("tool arguments must be a JSON object");
+                }
+                let id = raw["id"].as_str().unwrap_or("").to_owned();
+                if id.is_empty() {
+                    bail!("model returned a tool call without an id");
+                }
+                calls.push(ToolCall {
+                    id,
+                    name: raw["function"]["name"].as_str().unwrap_or("").to_owned(),
+                    arguments,
+                });
+            }
+        }
+        if content.is_empty() && calls.is_empty() {
             bail!("model returned empty response")
         }
-        Ok(content)
+        Ok(Completion {
+            text: content,
+            calls,
+            assistant_message,
+        })
+    }
+
+    pub fn tool_schemas(
+        allow_remember: bool,
+        allow_persona: bool,
+        allow_stickers: bool,
+    ) -> Vec<Value> {
+        let mut tools = vec![
+            json!({"type":"function","function":{"name":"search_memory","description":"Search memories available in this conversation only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}),
+        ];
+        if allow_remember {
+            tools.push(json!({"type":"function","function":{"name":"remember","description":"Save a durable user fact or preference to the permitted memory scope.","parameters":{"type":"object","properties":{"kind":{"type":"string","enum":["fact","profile","experience","style"]},"subject":{"type":"string"},"text":{"type":"string"},"importance":{"type":"integer","minimum":0,"maximum":5}},"required":["kind","subject","text"],"additionalProperties":false}}}));
+        }
+        if allow_stickers {
+            tools.push(json!({"type":"function","function":{"name":"search_stickers","description":"Find sticker IDs by name and tags before choosing one.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}));
+            tools.push(json!({"type":"function","function":{"name":"send_sticker","description":"Send one sticker from the local sticker catalog.","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}}}));
+        }
+        if allow_persona {
+            tools.push(json!({"type":"function","function":{"name":"set_persona","description":"Switch this private conversation to a configured persona.","parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}}}));
+        }
+        tools
     }
 
     pub async fn extract_memories(
@@ -226,7 +336,7 @@ fn build_prompt(c: &Config, store: &Store, e: &Event, text: &str) -> Result<Stri
                     s["id"], s["name"], s["tags"]
                 ));
             }
-            prompt.push_str("\n需要发表情时，在回复末尾加 [[sticker:ID]]，并且只用上面列出的 ID；不需要时不要输出标记。");
+            prompt.push_str("\n需要发送表情时，先通过 search_stickers 查找，再调用 send_sticker；每轮最多一个。不需要时不调用发送工具。");
         }
     }
     Ok(prompt)
@@ -271,5 +381,23 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].importance, 5);
         assert_eq!(parsed[0].session, "session");
+    }
+
+    #[test]
+    fn social_tools_exclude_memory_writes_and_persona_changes() {
+        let names: Vec<_> = ModelClient::tool_schemas(false, false, true)
+            .into_iter()
+            .map(|x| x["function"]["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(names.contains(&"search_memory".to_owned()));
+        assert!(names.contains(&"search_stickers".to_owned()));
+        assert!(names.contains(&"send_sticker".to_owned()));
+        assert!(!names.contains(&"remember".to_owned()));
+        assert!(!names.contains(&"set_persona".to_owned()));
+        assert!(
+            names
+                .iter()
+                .all(|name| !["shell", "http", "execute"].contains(&name.as_str()))
+        );
     }
 }
