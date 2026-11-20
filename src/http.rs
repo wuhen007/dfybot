@@ -84,6 +84,7 @@ pub fn router(engine: Engine, cfg: Arc<Config>, token: &str) -> Router {
         .route("/health", get(health))
         .route("/official/webhook", post(official_webhook))
         .route("/api/status", get(status))
+        .route("/api/pet/state", get(pet_state))
         .route("/api/sessions", get(sessions))
         .route("/api/proactive/sessions", get(proactive_sessions))
         .route("/api/sessions/{key}", get(session).delete(delete_session))
@@ -162,6 +163,60 @@ async fn status(State(s): State<AppState>) -> Json<Value> {
     Json(
         json!({"ok":true,"enabled":st.enabled,"dry_run":st.dry_run,"official_enabled":s.cfg.official.enabled,"onebot_enabled":s.cfg.onebot.enabled,"voice_enabled":s.cfg.voice.enabled,"queue_capacity":s.cfg.server.queue_capacity,"workers":s.cfg.server.workers}),
     )
+}
+async fn pet_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let settings = s.engine.settings_handle().lock().await.clone();
+    let mut mood_sum = 0.0_f32;
+    let mut count = 0_u32;
+    let mut latest_user = 0_i64;
+    let mut latest_assistant = 0_i64;
+    for session in s.store.sessions(500)? {
+        if !validate_proactive_session(&s.store, &session.key, &s.cfg.chat.owners)? {
+            continue;
+        }
+        mood_sum += s.store.mood(&session.key);
+        count += 1;
+        if let Ok((user, assistant)) = s.store.activity(&session.key) {
+            latest_user = latest_user.max(user.unwrap_or(0));
+            latest_assistant = latest_assistant.max(assistant.unwrap_or(0));
+        }
+    }
+    let mood = if count == 0 {
+        0.0
+    } else {
+        mood_sum / count as f32
+    };
+    let local = (chrono::Utc::now().timestamp() + i64::from(settings.utc_offset_hours) * 3600)
+        .rem_euclid(86400) as u32
+        / 3600;
+    let sleeping = !is_awake(local, settings.awake_start, settings.awake_end);
+    let thinking = latest_user > latest_assistant && now() - latest_user < 180;
+    let activity = if sleeping {
+        "sleeping"
+    } else if thinking {
+        "thinking"
+    } else {
+        "idle"
+    };
+    let mood_label = if mood > 0.8 {
+        "开心"
+    } else if mood < -0.8 {
+        "低落"
+    } else {
+        "平静"
+    };
+    Ok(Json(
+        json!({"name":"大肥鱼","activity":activity,"mood":mood,"mood_label":mood_label,"owner_sessions":count,"chat_enabled":settings.enabled,"proactive_enabled":settings.proactive}),
+    ))
+}
+fn is_awake(hour: u32, start: u32, end: u32) -> bool {
+    if start == end {
+        false
+    } else if start < end {
+        start <= hour && hour < end
+    } else {
+        hour >= start || hour < end
+    }
 }
 async fn sessions(
     State(s): State<AppState>,
@@ -580,6 +635,47 @@ mod tests {
             .to_bytes();
         let settings: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(settings["group_mode"], "mention");
+    }
+
+    #[tokio::test]
+    async fn pet_state_is_authenticated_and_does_not_include_chat_text() {
+        let cfg = Arc::new(Config::default());
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let engine = Engine::new(cfg.clone(), store).unwrap();
+        let app = router(engine, cfg, "a sufficiently long test token value");
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/pet/state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/pet/state")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        "Bearer a sufficiently long test token value",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let state: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(state.get("activity").is_some());
+        assert!(state.get("messages").is_none());
+        assert!(state.get("text").is_none());
     }
 
     #[tokio::test]

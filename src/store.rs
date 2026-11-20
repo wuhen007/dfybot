@@ -217,6 +217,14 @@ impl Store {
             )
             .optional()?)
     }
+    pub fn activity(&self, session: &str) -> Result<(Option<i64>, Option<i64>)> {
+        let db = self.db();
+        Ok(db.query_row(
+            "SELECT max(CASE WHEN role='user' THEN created_at END),max(CASE WHEN role='assistant' THEN created_at END) FROM messages WHERE session=?1",
+            [session],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
+    }
     pub fn add_memory(
         &self,
         session: &str,

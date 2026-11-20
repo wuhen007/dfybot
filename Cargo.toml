@@ -5,6 +5,19 @@ edition = "2024"
 license = "MIT"
 description = "Standalone Rust QQ companion server: OneBot and QQ official bot"
 
+[features]
+default = []
+desktop-pet = ["dep:eframe"]
+
+[[bin]]
+name = "aurabot"
+path = "src/main.rs"
+
+[[bin]]
+name = "aurabot-pet"
+path = "src/pet.rs"
+required-features = ["desktop-pet"]
+
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws", "multipart"] }
@@ -12,6 +25,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "2"
+eframe = { version = "0.37", optional = true, default-features = false, features = ["default_fonts", "system_fonts", "glow"] }
 futures-util = "0.3"
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }

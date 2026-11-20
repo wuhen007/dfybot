@@ -4,7 +4,7 @@ Aurabot Rust is a standalone, single-process QQ companion server. It does not lo
 
 ## Current state
 
-This is the first implementation pass. Implemented foundations include OneBot reverse WebSocket intake and HTTP replies; QQ Open Platform Webhook signature verification/validation and Gateway intake; a bounded, ordered conversation queue; OpenAI-compatible chat/ASR/TTS clients; SQLite chat history and memory; private web management panel; persona selection; proactive scheduling; and database backup/restore. QQ Open Platform permissions and supported scenes remain controlled by Tencent. OneBot voice sending requires a local ffmpeg and a configured SILK encoder. QQ official voice sending requires TTS in Opus format. Production credentials and real QQ sandboxes have not been configured here.
+This is an early implementation. Current capabilities include OneBot reverse WebSocket intake and HTTP replies; QQ Open Platform Webhook signature verification/validation and Gateway intake; a bounded, ordered conversation queue; OpenAI-compatible chat/ASR/TTS clients and permission-scoped built-in tools; SQLite chat history and categorized memory; a private web management panel; owner-scoped proactive scheduling; and database backup/restore. An optional desktop pet is built as a separate binary. QQ Open Platform permissions and supported scenes remain controlled by Tencent. OneBot voice sending requires a local ffmpeg and a configured SILK encoder. QQ official voice sending requires TTS in Opus format. Production credentials and real QQ sandboxes have not been configured here.
 
 The existing plugin is MIT licensed. This rewrite keeps a compatible project license and attributes the original product concept to its project, while keeping its implementation independent.
 
@@ -69,6 +69,17 @@ The target includes chat and interruption controls, independent personalities an
 The model can search conversation-scoped memories and stickers. It may save a memory only where the configured memory permission allows it; owner-private memory is shared only with owner private conversations. Persona switching is owner-private only. Sticker sending follows the existing channel and dry-run behavior. The server does not execute model-supplied shell commands, arbitrary HTTP requests, or downloaded plugins.
 
 Proactive chat is limited to configured owner private conversations. The panel supports rotating goals, awake hours including overnight ranges, a per-conversation interval, and an optional once-a-day goodnight message. Group chats and sessions whose recorded user is not a configured owner are rejected by the scheduler and settings API.
+
+## Desktop pet
+
+Build the optional floating desktop client separately from the server:
+
+```powershell
+cargo build --release --features desktop-pet --bin aurabot-pet
+.\target\release\aurabot-pet.exe --server http://127.0.0.1:8788 --token-file data/admin.token
+```
+
+The client polls the authenticated `/api/pet/state` endpoint every three seconds and only receives aggregate owner-session mood/activity, not messages. Local HTTP is accepted only for loopback addresses; remote server URLs require HTTPS. The floating window is transparent, draggable and always on top. Right-click it to exit.
 
 ## License
 
