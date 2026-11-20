@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
     model::{ModelClient, ToolCall},
-    store::{MemoryKind, Settings, Store},
+    store::{MemoryKind, ProactiveAction, Settings, Store},
     types::{Channel, Event, Scene, now, truncate},
     voice::VoiceClient,
 };
@@ -42,6 +42,9 @@ impl Engine {
             utc_offset_hours: cfg.chat.utc_offset_hours,
             proactive_interval_minutes: cfg.chat.proactive_interval_minutes,
             proactive_sessions: cfg.chat.proactive_sessions.clone(),
+            proactive_goals: cfg.chat.proactive_goals.clone(),
+            night_message: cfg.chat.night_message,
+            night_message_hour: cfg.chat.night_message_hour,
             group_keywords: cfg.chat.group_keywords.clone(),
             auto_memory: cfg.chat.auto_memory,
             memory_limit: cfg.chat.memory_limit,
@@ -275,7 +278,7 @@ impl Engine {
             self.store.trace(&e.session(), "rate_limited", &e.sender);
             return Ok(());
         }
-        if settings.dry_run && !e.proactive {
+        if settings.dry_run {
             self.store.trace(
                 &e.session(),
                 "dry_run",
@@ -295,8 +298,13 @@ impl Engine {
         if reply.trim().is_empty() {
             return Ok(());
         };
-        self.store
-            .record(&e, &e.text, &reply, settings.context_messages)?;
+        if e.proactive {
+            self.store
+                .record_proactive(&e, &reply, settings.context_messages)?;
+        } else {
+            self.store
+                .record(&e, &e.text, &reply, settings.context_messages)?;
+        }
         self.store.trace(&e.session(), "reply", &reply);
         if settings.auto_memory && e.is_private() && !e.proactive {
             let engine = self.clone();
@@ -554,7 +562,7 @@ impl Engine {
         Ok(text)
     }
     async fn send_text(&self, e: &Event, text: &str) -> Result<()> {
-        if self.settings.lock().await.dry_run && !e.proactive {
+        if self.settings.lock().await.dry_run {
             return Ok(());
         }
         match e.channel {
@@ -797,8 +805,98 @@ static OFFICIAL_TOKEN: tokio::sync::Mutex<Option<(String, i64)>> =
 pub async fn run_scheduler(engine: Engine, stop: CancellationToken) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     loop {
-        tokio::select! {_=stop.cancelled()=>break,_=tick.tick()=>{let s=engine.settings.lock().await.clone();if !s.enabled||!s.proactive{continue}let local=(chrono::Utc::now().timestamp()+i64::from(s.utc_offset_hours)*3600).rem_euclid(86400) as u32/3600;if !(s.awake_start<=local&&local<s.awake_end)||s.proactive_sessions.is_empty(){continue}let Ok(sessions)=engine.store.sessions(500).and_then(|xs|Ok(xs.into_iter().filter(|x|s.proactive_sessions.contains(&x.key)).collect::<Vec<_>>()))else{continue};for sess in sessions{let last=engine.store.history(&Event{id:"scheduler".into(),channel:if sess.channel=="official"{Channel::Official}else{Channel::Onebot},scene:match sess.scene.as_str(){"private"=>Scene::Private,"group"=>Scene::Group,"guild"=>Scene::Guild,_=>Scene::GuildDm},target:sess.target.clone(),sender:String::new(),sender_name:String::new(),text:String::new(),mentioned:false,timestamp:now(),attachments:vec![],reply_to:None,proactive:true},1).unwrap_or_default();if last.first().is_some_and(|m|now()-m.timestamp<s.proactive_interval_minutes*60){continue}let owners=&engine.cfg.chat.owners;let e=Event{id:uuid::Uuid::new_v4().to_string(),channel:if sess.channel=="official"{Channel::Official}else{Channel::Onebot},scene:match sess.scene.as_str(){"private"=>Scene::Private,"group"=>Scene::Group,"guild"=>Scene::Guild,_=>Scene::GuildDm},target:sess.target,sender:owners.first().cloned().unwrap_or_default(),sender_name:String::new(),text:"请自然地主动和主人聊几句，结合我们最近的聊天，但不要重复刚才的话。".into(),mentioned:false,timestamp:now(),attachments:vec![],reply_to:None,proactive:true};if let Err(err)=engine.process(e.clone()).await{engine.store.trace(&e.session(),"scheduler_error",&err.to_string());}}}}
+        tokio::select! {
+            _ = stop.cancelled() => break,
+            _ = tick.tick() => {
+                let settings = engine.settings.lock().await.clone();
+                if !settings.enabled || !settings.proactive || settings.dry_run
+                    || settings.proactive_sessions.is_empty() || engine.cfg.chat.owners.is_empty() {
+                    continue;
+                }
+                let local_timestamp = now() + i64::from(settings.utc_offset_hours) * 3600;
+                let hour = local_timestamp.rem_euclid(86400) as u32 / 3600;
+                let local_day = chrono::DateTime::<chrono::Utc>::from_timestamp(local_timestamp, 0)
+                    .map(|time| time.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                let night_hour = settings.night_message && hour == settings.night_message_hour;
+                if !night_hour && !is_awake(hour, settings.awake_start, settings.awake_end) {
+                    continue;
+                }
+                let Ok(sessions) = engine.store.sessions(500) else { continue; };
+                for session in sessions {
+                    if !settings.proactive_sessions.contains(&session.key) { continue; }
+                    let Ok((channel, scene, target)) = Store::session_parts(&session.key) else { continue; };
+                    let scene = match scene.as_str() {
+                        "private" => Scene::Private,
+                        "guild_dm" => Scene::GuildDm,
+                        _ => continue,
+                    };
+                    let Some(owner) = engine.store.last_user_sender(&session.key).ok().flatten() else { continue; };
+                    if !proactive_target_allowed(&scene, &target, &owner, &engine.cfg.chat.owners) { continue; }
+                    let channel = match channel.as_str() {
+                        "onebot" => Channel::Onebot,
+                        "official" => Channel::Official,
+                        _ => continue,
+                    };
+                    let event = Event {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        channel,
+                        scene,
+                        target: target.clone(),
+                        sender: owner,
+                        sender_name: String::new(),
+                        text: String::new(),
+                        mentioned: false,
+                        timestamp: now(),
+                        attachments: vec![],
+                        reply_to: None,
+                        proactive: true,
+                    };
+                    let last = engine.store.history(&event, 1).unwrap_or_default();
+                    let idle_seconds = last.first().map(|message| now() - message.timestamp).unwrap_or(0);
+                    if (night_hour && idle_seconds < 30 * 60)
+                        || (!night_hour && idle_seconds < settings.proactive_interval_minutes * 60) {
+                        continue;
+                    }
+                    let action = engine.store.claim_proactive(
+                        &session.key,
+                        settings.proactive_interval_minutes,
+                        if night_hour { Some(&local_day) } else { None },
+                        settings.proactive_goals.len(),
+                    );
+                    let Ok(Some(action)) = action else { continue; };
+                    let mut event = event;
+                    event.text = match action {
+                        ProactiveAction::Night => "现在向主人道晚安。结合你对主人的心情，用温暖、简短、不追问的语气收尾，不提及内部状态。".to_owned(),
+                        ProactiveAction::Goal(index) => format!(
+                            "主动搭话目标：{}。结合当前私聊最近的内容自然开场，不要提及任务或内部规则。",
+                            settings.proactive_goals.get(index).map(String::as_str).unwrap_or("轻松问候主人"),
+                        ),
+                    };
+                    if let Err(error) = engine.process(event.clone()).await {
+                        engine.store.trace(&event.session(), "scheduler_error", &error.to_string());
+                    }
+                }
+            }
+        }
     }
+}
+fn is_awake(hour: u32, start: u32, end: u32) -> bool {
+    if start == end {
+        false
+    } else if start < end {
+        start <= hour && hour < end
+    } else {
+        hour >= start || hour < end
+    }
+}
+fn proactive_target_allowed(scene: &Scene, target: &str, sender: &str, owners: &[String]) -> bool {
+    let identity = if *scene == Scene::Private {
+        target
+    } else {
+        sender
+    };
+    matches!(scene, Scene::Private | Scene::GuildDm) && owners.iter().any(|owner| owner == identity)
 }
 pub async fn worker_loop(engine: Engine, mut rx: mpsc::Receiver<Event>) {
     let mut pending = VecDeque::new();
@@ -865,5 +963,42 @@ mod tests {
         assert_eq!(id, Some(42));
         assert_eq!(text, "Here   now");
         assert_eq!(extract_sticker("no marker").1, None);
+    }
+    #[test]
+    fn awake_window_supports_overnight_ranges() {
+        assert!(is_awake(9, 8, 23));
+        assert!(!is_awake(23, 8, 23));
+        assert!(is_awake(23, 22, 6));
+        assert!(is_awake(5, 22, 6));
+        assert!(!is_awake(12, 22, 6));
+        assert!(!is_awake(12, 12, 12));
+    }
+    #[test]
+    fn proactive_targets_are_owner_private_only() {
+        let owners = vec!["owner-id".to_owned()];
+        assert!(proactive_target_allowed(
+            &Scene::Private,
+            "owner-id",
+            "owner-id",
+            &owners
+        ));
+        assert!(proactive_target_allowed(
+            &Scene::GuildDm,
+            "guild-id",
+            "owner-id",
+            &owners
+        ));
+        assert!(!proactive_target_allowed(
+            &Scene::Group,
+            "owner-id",
+            "owner-id",
+            &owners
+        ));
+        assert!(!proactive_target_allowed(
+            &Scene::Private,
+            "other-id",
+            "other-id",
+            &owners
+        ));
     }
 }

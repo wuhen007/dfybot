@@ -85,6 +85,7 @@ pub fn router(engine: Engine, cfg: Arc<Config>, token: &str) -> Router {
         .route("/official/webhook", post(official_webhook))
         .route("/api/status", get(status))
         .route("/api/sessions", get(sessions))
+        .route("/api/proactive/sessions", get(proactive_sessions))
         .route("/api/sessions/{key}", get(session).delete(delete_session))
         .route("/api/sessions/{key}/interject", post(interject))
         .route("/api/traces", get(traces))
@@ -168,6 +169,51 @@ async fn sessions(
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!(s.store.sessions(q.limit)?)))
 }
+async fn proactive_sessions(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let sessions = s.store.sessions(500)?;
+    let allowed: Vec<_> = sessions
+        .into_iter()
+        .filter(|session| {
+            if session.scene == "private" {
+                s.cfg
+                    .chat
+                    .owners
+                    .iter()
+                    .any(|owner| owner == &session.target)
+            } else if session.scene == "guild_dm" {
+                s.store
+                    .last_user_sender(&session.key)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|sender| s.cfg.chat.owners.iter().any(|owner| owner == &sender))
+            } else {
+                false
+            }
+        })
+        .collect();
+    Ok(Json(json!(allowed)))
+}
+fn validate_proactive_session(
+    store: &Store,
+    key: &str,
+    owners: &[String],
+) -> Result<bool, ApiError> {
+    let (channel, scene, target) =
+        Store::session_parts(key).map_err(|_| ApiError::bad("invalid proactive session"))?;
+    if !["onebot", "official"].contains(&channel.as_str())
+        || !["private", "guild_dm"].contains(&scene.as_str())
+    {
+        return Ok(false);
+    }
+    let identity = if scene == "private" {
+        target
+    } else {
+        store
+            .last_user_sender(key)?
+            .ok_or_else(|| ApiError::bad("proactive session has no owner messages"))?
+    };
+    Ok(owners.iter().any(|owner| owner == &identity))
+}
 async fn session(
     State(s): State<AppState>,
     Path(key): Path<String>,
@@ -212,7 +258,7 @@ async fn traces(
 async fn get_settings(State(s): State<AppState>) -> Json<Value> {
     let x = s.engine.settings_handle().lock().await.clone();
     Json(
-        json!({"enabled":x.enabled,"dry_run":x.dry_run,"persona":x.persona,"group_mode":x.group_mode,"voice_replies":x.voice_replies,"proactive":x.proactive,"context_messages":x.context_messages,"group_keywords":x.group_keywords,"cooldown_secs":x.cooldown_secs,"memory_limit":x.memory_limit,"memory_recall":x.memory_recall,"auto_memory":x.auto_memory,"awake_start":x.awake_start,"awake_end":x.awake_end,"utc_offset_hours":x.utc_offset_hours,"proactive_interval_minutes":x.proactive_interval_minutes,"proactive_sessions":x.proactive_sessions,"max_reply_chars":s.cfg.chat.max_reply_chars,"max_reply_parts":s.cfg.chat.max_reply_parts,"model_name":s.cfg.model.name,"vision":s.cfg.model.vision,"tts_model":s.cfg.voice.tts_model,"asr_model":s.cfg.voice.asr_model,"tts_voice":s.cfg.voice.tts_voice,"sticker_count":s.store.stickers(100).map(|x|x.len()).unwrap_or(0)}),
+        json!({"enabled":x.enabled,"dry_run":x.dry_run,"persona":x.persona,"group_mode":x.group_mode,"voice_replies":x.voice_replies,"proactive":x.proactive,"context_messages":x.context_messages,"group_keywords":x.group_keywords,"cooldown_secs":x.cooldown_secs,"memory_limit":x.memory_limit,"memory_recall":x.memory_recall,"auto_memory":x.auto_memory,"awake_start":x.awake_start,"awake_end":x.awake_end,"utc_offset_hours":x.utc_offset_hours,"proactive_interval_minutes":x.proactive_interval_minutes,"proactive_sessions":x.proactive_sessions,"proactive_goals":x.proactive_goals,"night_message":x.night_message,"night_message_hour":x.night_message_hour,"max_reply_chars":s.cfg.chat.max_reply_chars,"max_reply_parts":s.cfg.chat.max_reply_parts,"model_name":s.cfg.model.name,"vision":s.cfg.model.vision,"tts_model":s.cfg.voice.tts_model,"asr_model":s.cfg.voice.asr_model,"tts_voice":s.cfg.voice.tts_voice,"sticker_count":s.store.stickers(100).map(|x|x.len()).unwrap_or(0)}),
     )
 }
 async fn put_settings(
@@ -228,6 +274,12 @@ async fn put_settings(
         || !(1..=24).contains(&v.awake_end)
         || !(-12..=14).contains(&v.utc_offset_hours)
         || !(5..=1440).contains(&v.proactive_interval_minutes)
+        || v.night_message_hour > 23
+        || v.proactive_goals.is_empty()
+        || v.proactive_goals.len() > 12
+        || v.proactive_goals
+            .iter()
+            .any(|g| g.trim().is_empty() || g.len() > 200)
         || v.group_keywords.len() > 50
         || v.group_keywords.iter().any(|x| x.len() > 100)
         || v.proactive_sessions.len() > 500
@@ -241,6 +293,13 @@ async fn put_settings(
         .contains_key(&v.persona)
     {
         return Err(ApiError::bad("unknown persona"));
+    }
+    for key in &v.proactive_sessions {
+        if !validate_proactive_session(&s.store, key, &s.cfg.chat.owners)? {
+            return Err(ApiError::bad(
+                "proactive sessions must be owner private chats",
+            ));
+        }
     }
     let handle = s.engine.settings_handle();
     let mut live = handle.lock().await;
@@ -562,5 +621,17 @@ mod tests {
             serde_json::from_slice::<Value>(&bytes).unwrap()["imported"],
             1
         );
+    }
+
+    #[test]
+    fn proactive_allowlist_rejects_groups_and_non_owner_chats() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let owners = vec!["owner".to_owned()];
+        let group = serde_json::to_string(&("onebot", "group", "room")).unwrap();
+        let stranger = serde_json::to_string(&("onebot", "private", "stranger")).unwrap();
+        let owner_dm = serde_json::to_string(&("onebot", "private", "owner")).unwrap();
+        assert!(!validate_proactive_session(&store, &group, &owners).unwrap());
+        assert!(!validate_proactive_session(&store, &stranger, &owners).unwrap());
+        assert!(validate_proactive_session(&store, &owner_dm, &owners).unwrap());
     }
 }

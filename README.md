@@ -68,6 +68,8 @@ The target includes chat and interruption controls, independent personalities an
 
 The model can search conversation-scoped memories and stickers. It may save a memory only where the configured memory permission allows it; owner-private memory is shared only with owner private conversations. Persona switching is owner-private only. Sticker sending follows the existing channel and dry-run behavior. The server does not execute model-supplied shell commands, arbitrary HTTP requests, or downloaded plugins.
 
+Proactive chat is limited to configured owner private conversations. The panel supports rotating goals, awake hours including overnight ranges, a per-conversation interval, and an optional once-a-day goodnight message. Group chats and sessions whose recorded user is not a configured owner are rejected by the scheduler and settings API.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

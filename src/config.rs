@@ -44,6 +44,9 @@ pub struct Chat {
     pub proactive: bool,
     pub proactive_interval_minutes: i64,
     pub proactive_sessions: Vec<String>,
+    pub proactive_goals: Vec<String>,
+    pub night_message: bool,
+    pub night_message_hour: u32,
     pub awake_start: u32,
     pub awake_end: u32,
     pub utc_offset_hours: i32,
@@ -138,7 +141,7 @@ impl Default for Server {
 }
 impl Default for Chat {
     fn default() -> Self {
-        Self { enabled:false,dry_run:true,owners:vec![],allowed_sessions:vec![],group_mode:"mention".into(),group_keywords:vec![],group_debounce_ms:800,context_messages:24,max_input_chars:6000,max_reply_chars:1200,max_reply_parts:3,cooldown_secs:2,memory_limit:3000,memory_recall:6,auto_memory:true,proactive:false,proactive_interval_minutes:120,proactive_sessions:vec![],awake_start:8,awake_end:23,utc_offset_hours:8,personas:BTreeMap::from([("default".into(),"你是大肥鱼，一个温暖、自然、有自己想法的聊天伙伴。尊重每个人的隐私，不冒充真人。用简洁的中文交流。".into())]),persona:"default".into(),session_personas:BTreeMap::new(),session_models:BTreeMap::new(),voice_replies:false,stickers:true,memory_permission:Permission::OwnerPrivate }
+        Self { enabled:false,dry_run:true,owners:vec![],allowed_sessions:vec![],group_mode:"mention".into(),group_keywords:vec![],group_debounce_ms:800,context_messages:24,max_input_chars:6000,max_reply_chars:1200,max_reply_parts:3,cooldown_secs:2,memory_limit:3000,memory_recall:6,auto_memory:true,proactive:false,proactive_interval_minutes:120,proactive_sessions:vec![],proactive_goals:vec!["问候主人，轻松开启一段对话".into(),"自然地接续最近聊过的话题".into(),"分享一个简短的问题或观察".into()],night_message:false,night_message_hour:22,awake_start:8,awake_end:23,utc_offset_hours:8,personas:BTreeMap::from([("default".into(),"你是大肥鱼，一个温暖、自然、有自己想法的聊天伙伴。尊重每个人的隐私，不冒充真人。用简洁的中文交流。".into())]),persona:"default".into(),session_personas:BTreeMap::new(),session_models:BTreeMap::new(),voice_replies:false,stickers:true,memory_permission:Permission::OwnerPrivate }
     }
 }
 impl Default for Model {
@@ -233,6 +236,11 @@ impl Config {
             || c.awake_end > 24
             || !(-12..=14).contains(&c.utc_offset_hours)
             || c.proactive_interval_minutes < 5
+            || c.night_message_hour > 23
+            || c.proactive_goals.len() > 12
+            || c.proactive_goals
+                .iter()
+                .any(|g| g.trim().is_empty() || g.len() > 200)
         {
             bail!("invalid proactive schedule");
         }

@@ -82,11 +82,32 @@ pub struct Settings {
     pub utc_offset_hours: i32,
     pub proactive_interval_minutes: i64,
     pub proactive_sessions: Vec<String>,
+    #[serde(default = "default_proactive_goals")]
+    pub proactive_goals: Vec<String>,
+    #[serde(default)]
+    pub night_message: bool,
+    #[serde(default = "default_night_hour")]
+    pub night_message_hour: u32,
     pub group_keywords: Vec<String>,
     pub auto_memory: bool,
     pub memory_limit: usize,
     pub memory_recall: usize,
     pub cooldown_secs: i64,
+}
+fn default_proactive_goals() -> Vec<String> {
+    vec![
+        "问候主人，轻松开启一段对话".into(),
+        "自然地接续最近聊过的话题".into(),
+    ]
+}
+fn default_night_hour() -> u32 {
+    22
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProactiveAction {
+    Night,
+    Goal(usize),
 }
 
 impl Store {
@@ -110,7 +131,8 @@ impl Store {
         CREATE TABLE IF NOT EXISTS session_policy(session TEXT PRIMARY KEY,persona TEXT,model TEXT,mode TEXT,updated_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS received_events(event_key TEXT PRIMARY KEY,created_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS moods(session TEXT PRIMARY KEY,value REAL NOT NULL,updated_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS rate_limits(session TEXT NOT NULL,sender TEXT NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(session,sender));")?;
+        CREATE TABLE IF NOT EXISTS rate_limits(session TEXT NOT NULL,sender TEXT NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(session,sender));
+        CREATE TABLE IF NOT EXISTS proactive_state(session TEXT PRIMARY KEY,last_regular_at INTEGER NOT NULL DEFAULT 0,next_goal INTEGER NOT NULL DEFAULT 0,last_night_day TEXT NOT NULL DEFAULT '');")?;
         if !has_column(&db, "memories", "kind")? {
             db.execute(
                 "ALTER TABLE memories ADD COLUMN kind TEXT NOT NULL DEFAULT 'fact'",
@@ -159,6 +181,18 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    pub fn record_proactive(&self, e: &Event, assistant: &str, context: usize) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let key = e.session();
+        tx.execute(
+            "INSERT INTO messages(session,role,sender,content,created_at) VALUES(?1,'assistant','bot',?2,?3)",
+            params![key, truncate(assistant, 8000), now()],
+        )?;
+        tx.execute("DELETE FROM messages WHERE session=?1 AND id NOT IN (SELECT id FROM messages WHERE session=?1 ORDER BY id DESC LIMIT ?2)",params![key,(context.max(2)*2) as i64])?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn history(&self, e: &Event, limit: usize) -> Result<Vec<Message>> {
         let db = self.db();
         let mut stmt=db.prepare("SELECT role,sender,content,created_at FROM (SELECT role,sender,content,created_at,id FROM messages WHERE session=?1 ORDER BY id DESC LIMIT ?2) ORDER BY id")?;
@@ -172,6 +206,16 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn last_user_sender(&self, session: &str) -> Result<Option<String>> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT sender FROM messages WHERE session=?1 AND role='user' ORDER BY id DESC LIMIT 1",
+                [session],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
     pub fn add_memory(
         &self,
@@ -359,6 +403,48 @@ impl Store {
     }
     pub fn claim_cooldown(&self, session: &str, sender: &str, seconds: i64) -> Result<bool> {
         Ok(self.db().execute("INSERT INTO rate_limits(session,sender,at) VALUES(?1,?2,?3) ON CONFLICT(session,sender) DO UPDATE SET at=excluded.at WHERE rate_limits.at<=?4",params![session,sender,now(),now()-seconds.max(0)])?==1)
+    }
+    pub fn claim_proactive(
+        &self,
+        session: &str,
+        interval_minutes: i64,
+        night_day: Option<&str>,
+        goal_count: usize,
+    ) -> Result<Option<ProactiveAction>> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO proactive_state(session) VALUES(?1)",
+            [session],
+        )?;
+        let (last_regular, next_goal, last_night): (i64, usize, String) = tx.query_row(
+            "SELECT last_regular_at,next_goal,last_night_day FROM proactive_state WHERE session=?1",
+            [session],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if let Some(day) = night_day {
+            if day != last_night {
+                tx.execute(
+                    "UPDATE proactive_state SET last_night_day=?2 WHERE session=?1",
+                    params![session, day],
+                )?;
+                tx.commit()?;
+                return Ok(Some(ProactiveAction::Night));
+            }
+            tx.commit()?;
+            return Ok(None);
+        }
+        if now() - last_regular >= interval_minutes.max(1) * 60 && goal_count > 0 {
+            let goal = next_goal % goal_count;
+            tx.execute(
+                "UPDATE proactive_state SET last_regular_at=?2,next_goal=?3 WHERE session=?1",
+                params![session, now(), goal + 1],
+            )?;
+            tx.commit()?;
+            return Ok(Some(ProactiveAction::Goal(goal)));
+        }
+        tx.commit()?;
+        Ok(None)
     }
     pub fn sessions(&self, limit: usize) -> Result<Vec<Session>> {
         let db = self.db();
@@ -644,5 +730,26 @@ mod tests {
         assert!(s.claim_cooldown("a", "u", 2).unwrap());
         assert!(!s.claim_cooldown("a", "u", 2).unwrap());
         assert!(s.claim_cooldown("b", "u", 2).unwrap());
+    }
+    #[test]
+    fn proactive_state_rotates_goals_and_deduplicates_goodnight() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        assert_eq!(
+            store.claim_proactive("s", 60, None, 2).unwrap(),
+            Some(ProactiveAction::Goal(0))
+        );
+        assert_eq!(store.claim_proactive("s", 60, None, 2).unwrap(), None);
+        assert_eq!(
+            store
+                .claim_proactive("s", 60, Some("2026-11-21"), 2)
+                .unwrap(),
+            Some(ProactiveAction::Night)
+        );
+        assert_eq!(
+            store
+                .claim_proactive("s", 60, Some("2026-11-21"), 2)
+                .unwrap(),
+            None
+        );
     }
 }
