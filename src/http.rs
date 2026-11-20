@@ -88,6 +88,7 @@ pub fn router(engine: Engine, cfg: Arc<Config>, token: &str) -> Router {
         .route("/api/sessions", get(sessions))
         .route("/api/proactive/sessions", get(proactive_sessions))
         .route("/api/sessions/{key}", get(session).delete(delete_session))
+        .route("/api/sessions/{key}/interrupt", post(interrupt_session))
         .route("/api/sessions/{key}/interject", post(interject))
         .route("/api/traces", get(traces))
         .route("/api/settings", get(get_settings).put(put_settings))
@@ -288,6 +289,17 @@ async fn delete_session(
     }
     s.store.forget_session(&key)?;
     Ok(Json(json!({"ok":true})))
+}
+async fn interrupt_session(
+    State(s): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if key.len() > 512 {
+        return Err(ApiError::bad("invalid session key"));
+    }
+    Store::session_parts(&key).map_err(|_| ApiError::bad("invalid session key"))?;
+    let interrupted = s.engine.interrupt(&key).await;
+    Ok(Json(json!({"interrupted":interrupted})))
 }
 #[derive(Deserialize)]
 struct Interjection {
@@ -635,6 +647,49 @@ mod tests {
             .to_bytes();
         let settings: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(settings["group_mode"], "mention");
+    }
+
+    #[tokio::test]
+    async fn interrupt_route_requires_auth_and_reports_when_idle() {
+        let cfg = Arc::new(Config::default());
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let engine = Engine::new(cfg.clone(), store).unwrap();
+        let app = router(engine, cfg, "a sufficiently long test token value");
+        let uri = "/api/sessions/%5B%22onebot%22%2C%22private%22%2C%22user-1%22%5D/interrupt";
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        "Bearer a sufficiently long test token value",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["interrupted"], false);
     }
 
     #[tokio::test]

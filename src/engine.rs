@@ -9,7 +9,11 @@ use anyhow::{Result, bail};
 use reqwest::Client;
 use serde_json::Value;
 use sha2::Digest;
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     sync::{Mutex, Semaphore, mpsc},
     time::sleep,
@@ -26,6 +30,7 @@ pub struct Engine {
     permit: Arc<Semaphore>,
     settings: Arc<Mutex<Settings>>,
     queue: Arc<Mutex<Option<Vec<mpsc::Sender<Event>>>>>,
+    active: Arc<Mutex<HashMap<String, CancellationToken>>>,
 }
 impl Engine {
     pub fn new(cfg: Arc<Config>, store: Store) -> Result<Self> {
@@ -63,6 +68,7 @@ impl Engine {
                 .build()?,
             settings: Arc::new(Mutex::new(settings)),
             queue: Arc::new(Mutex::new(None)),
+            active: Arc::new(Mutex::new(HashMap::new())),
         })
     }
     pub fn store(&self) -> &Store {
@@ -76,6 +82,15 @@ impl Engine {
     }
     pub fn settings_handle(&self) -> Arc<Mutex<Settings>> {
         self.settings.clone()
+    }
+    pub async fn interrupt(&self, key: &str) -> bool {
+        let active = self.active.lock().await;
+        if let Some(token) = active.get(key) {
+            token.cancel();
+            true
+        } else {
+            false
+        }
     }
     pub async fn interject(&self, key: &str, text: &str) -> Result<()> {
         let (channel, scene, target) = Store::session_parts(key)?;
@@ -169,7 +184,23 @@ impl Engine {
         };
         Ok(true)
     }
-    async fn process(&self, mut e: Event) -> Result<()> {
+    async fn process(&self, e: Event) -> Result<()> {
+        let key = e.session();
+        let cancel = CancellationToken::new();
+        self.active.lock().await.insert(key.clone(), cancel.clone());
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                self.store.trace(&key, "interrupted", "reply cancelled by operator");
+                Ok(())
+            }
+            result = self.process_event(e) => result,
+        };
+        self.active.lock().await.remove(&key);
+        result
+    }
+
+    async fn process_event(&self, mut e: Event) -> Result<()> {
         let settings = self.settings.lock().await.clone();
         let owner = self.cfg.chat.owners.iter().any(|x| x == &e.sender);
         let permit = self.permit.clone().acquire_owned().await?;
@@ -949,6 +980,56 @@ fn extract_sticker(text: &str) -> (String, Option<i64>) {
 mod tests {
     use super::*;
     use crate::config::Permission;
+    use std::path::Path;
+
+    #[tokio::test]
+    async fn interrupt_stops_processing_and_cleans_up_the_session() {
+        let cfg = Arc::new(Config::default());
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let engine = Engine::new(cfg, store).unwrap();
+        let held_permits = engine.permit.clone().acquire_many_owned(8).await.unwrap();
+        let event = Event {
+            id: "interrupt-test".into(),
+            channel: Channel::Onebot,
+            scene: Scene::Private,
+            target: "user-1".into(),
+            sender: "user-1".into(),
+            sender_name: "User".into(),
+            text: "hello".into(),
+            mentioned: false,
+            timestamp: now(),
+            attachments: vec![],
+            reply_to: None,
+            proactive: false,
+        };
+        let key = event.session();
+        let worker = engine.clone();
+        let task = tokio::spawn(async move { worker.process(event).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if engine.active.lock().await.contains_key(&key) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request should become active");
+
+        assert!(engine.interrupt(&key).await);
+        assert!(task.await.unwrap().is_ok());
+        assert!(!engine.active.lock().await.contains_key(&key));
+        assert!(
+            engine
+                .store
+                .traces(10)
+                .unwrap()
+                .iter()
+                .any(|trace| trace.kind == "interrupted" && trace.session == key)
+        );
+        drop(held_permits);
+    }
+
     #[test]
     fn permission_is_denied_for_group_by_default() {
         assert!(!Store::permission_allowed(
