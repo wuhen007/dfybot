@@ -62,7 +62,7 @@ Official QQ account IDs are opaque platform identifiers. They are kept separate 
 
 ## Planned capability set
 
-The target includes chat and interruption controls, independent personalities and mood, voice messages in both directions, emoji collection/use, long-term memory and person profiles, optional desktop pet, proactive private conversation, fine-grained permissions, and a full management panel. QQ Space, Bilibili, image generation and its arbitrary local endpoints, and the module marketplace are out of scope. Memory supports typed facts, profiles, relationship experience and speaking style, with search, edit, JSON import/export and private-chat extraction. The desktop pet and deeper behavior parity still need work and real QQ sandbox validation.
+The target includes chat and interruption controls, independent personalities and mood, voice messages in both directions, emoji collection/use, long-term memory and person profiles, optional desktop pet, proactive private conversation, fine-grained permissions, and a full management panel. QQ Space, Bilibili, image generation and its arbitrary local endpoints, and the module marketplace are out of scope. Memory supports typed facts, profiles, relationship experience and speaking style, with search, edit, JSON import/export and private-chat extraction. Mood is session-scoped, reacts to positive and negative messages independently of automatic memory, and fades over time. The optional desktop pet includes six state animations; broader behavior parity and real QQ sandbox validation remain in progress.
 
 ## Built-in tools
 

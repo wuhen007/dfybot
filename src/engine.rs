@@ -222,23 +222,8 @@ impl Engine {
                 return Ok(());
             }
         }
-        if settings.auto_memory {
-            let p = [
-                "喜欢",
-                "最爱",
-                "生日是",
-                "我叫",
-                "我的名字",
-                "记得我",
-                "我在",
-                "我住在",
-            ];
-            let n = ["讨厌", "不喜欢", "别再", "不要再"];
-            if p.iter().any(|x| e.text.contains(x)) {
-                self.store.affect(&e.session(), 0.35)
-            } else if n.iter().any(|x| e.text.contains(x)) {
-                self.store.affect(&e.session(), -0.35)
-            }
+        if let Some(signal) = mood_signal(&e.text) {
+            self.store.affect(&e.session(), signal);
         }
         let mode = self.cfg.chat.session_models.get(&e.session());
         let _ = mode;
@@ -976,11 +961,80 @@ fn extract_sticker(text: &str) -> (String, Option<i64>) {
     clean.replace_range(start..end, " ");
     (clean, id)
 }
+
+fn mood_signal(text: &str) -> Option<f32> {
+    if [
+        "不喜欢",
+        "讨厌",
+        "别再",
+        "不要再",
+        "难过",
+        "伤心",
+        "生气",
+        "失望",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal))
+    {
+        Some(-0.35)
+    } else if [
+        "喜欢",
+        "最爱",
+        "谢谢",
+        "开心",
+        "高兴",
+        "真棒",
+        "太好了",
+        "爱你",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal))
+    {
+        Some(0.35)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Permission;
     use std::path::Path;
+
+    #[test]
+    fn negative_mood_signals_take_precedence_over_positive_substrings() {
+        assert_eq!(mood_signal("我不喜欢这个"), Some(-0.35));
+        assert_eq!(mood_signal("谢谢你"), Some(0.35));
+        assert_eq!(mood_signal("我的生日是今天"), None);
+    }
+
+    #[tokio::test]
+    async fn mood_feedback_does_not_depend_on_automatic_memory() {
+        let mut cfg = Config::default();
+        cfg.chat.enabled = true;
+        cfg.chat.dry_run = true;
+        cfg.chat.auto_memory = false;
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let engine = Engine::new(Arc::new(cfg), store.clone()).unwrap();
+        let event = Event {
+            id: "mood-test".into(),
+            channel: Channel::Onebot,
+            scene: Scene::Private,
+            target: "user-1".into(),
+            sender: "user-1".into(),
+            sender_name: "User".into(),
+            text: "谢谢你，我很开心".into(),
+            mentioned: false,
+            timestamp: now(),
+            attachments: vec![],
+            reply_to: None,
+            proactive: false,
+        };
+        let session = event.session();
+        engine.process_event(event).await.unwrap();
+        assert!(store.mood(&session) > 0.0);
+    }
 
     #[tokio::test]
     async fn interrupt_stops_processing_and_cleans_up_the_session() {
