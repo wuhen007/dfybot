@@ -1,0 +1,680 @@
+use crate::{
+    config::Config,
+    model::ModelClient,
+    store::{Settings, Store},
+    types::{Channel, Event, Scene, now, truncate},
+    voice::VoiceClient,
+};
+use anyhow::{Result, bail};
+use reqwest::Client;
+use serde_json::Value;
+use sha2::Digest;
+use std::{collections::VecDeque, sync::Arc, time::Duration};
+use tokio::{
+    sync::{Mutex, Semaphore, mpsc},
+    time::sleep,
+};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone)]
+pub struct Engine {
+    cfg: Arc<Config>,
+    store: Store,
+    model: ModelClient,
+    voice: VoiceClient,
+    client: Client,
+    permit: Arc<Semaphore>,
+    settings: Arc<Mutex<Settings>>,
+    queue: Arc<Mutex<Option<Vec<mpsc::Sender<Event>>>>>,
+}
+impl Engine {
+    pub fn new(cfg: Arc<Config>, store: Store) -> Result<Self> {
+        let settings = store.settings(Settings {
+            enabled: cfg.chat.enabled,
+            dry_run: cfg.chat.dry_run,
+            persona: cfg.chat.persona.clone(),
+            group_mode: cfg.chat.group_mode.clone(),
+            voice_replies: cfg.chat.voice_replies,
+            proactive: cfg.chat.proactive,
+            context_messages: cfg.chat.context_messages,
+            awake_start: cfg.chat.awake_start,
+            awake_end: cfg.chat.awake_end,
+            utc_offset_hours: cfg.chat.utc_offset_hours,
+            proactive_interval_minutes: cfg.chat.proactive_interval_minutes,
+            proactive_sessions: cfg.chat.proactive_sessions.clone(),
+            group_keywords: cfg.chat.group_keywords.clone(),
+            auto_memory: cfg.chat.auto_memory,
+            memory_limit: cfg.chat.memory_limit,
+            memory_recall: cfg.chat.memory_recall,
+            cooldown_secs: cfg.chat.cooldown_secs,
+        });
+        Ok(Self {
+            permit: Arc::new(Semaphore::new(8)),
+            cfg,
+            store,
+            model: ModelClient::new()?,
+            voice: VoiceClient::new()?,
+            client: Client::builder()
+                .timeout(Duration::from_secs(20))
+                .pool_max_idle_per_host(16)
+                .build()?,
+            settings: Arc::new(Mutex::new(settings)),
+            queue: Arc::new(Mutex::new(None)),
+        })
+    }
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+    pub fn voice(&self) -> &VoiceClient {
+        &self.voice
+    }
+    pub fn settings_handle(&self) -> Arc<Mutex<Settings>> {
+        self.settings.clone()
+    }
+    pub async fn interject(&self, key: &str, text: &str) -> Result<()> {
+        let (channel, scene, target) = Store::session_parts(key)?;
+        let owner =
+            self.cfg.chat.owners.first().ok_or_else(|| {
+                anyhow::anyhow!("configure at least one owner account to interject")
+            })?;
+        let event = Event {
+            id: format!("panel-{}", uuid::Uuid::new_v4()),
+            channel: match channel.as_str() {
+                "onebot" => Channel::Onebot,
+                "official" => Channel::Official,
+                _ => bail!("unsupported channel"),
+            },
+            scene: match scene.as_str() {
+                "private" => Scene::Private,
+                "group" => Scene::Group,
+                "guild" => Scene::Guild,
+                "guild_dm" => Scene::GuildDm,
+                _ => bail!("unsupported scene"),
+            },
+            target,
+            sender: owner.clone(),
+            sender_name: "主人".into(),
+            text: truncate(text, 4000),
+            mentioned: true,
+            timestamp: now(),
+            attachments: vec![],
+            reply_to: None,
+            proactive: false,
+        };
+        self.submit(event).await
+    }
+    pub async fn start_workers(&self) {
+        let mut slot = self.queue.lock().await;
+        if slot.is_some() {
+            return;
+        }
+        let mut senders = Vec::new();
+        for _ in 0..self.cfg.server.workers {
+            let (tx, rx) = mpsc::channel(self.cfg.server.queue_capacity / self.cfg.server.workers);
+            senders.push(tx);
+            let e = self.clone();
+            tokio::spawn(worker_loop(e, rx));
+        }
+        *slot = Some(senders);
+    }
+    pub async fn submit(&self, e: Event) -> Result<()> {
+        let token = self.access(&e)?;
+        let settings = self.settings.lock().await.clone();
+        let keyword_hit = settings
+            .group_keywords
+            .iter()
+            .any(|w| !w.is_empty() && e.text.contains(w));
+        if !token
+            || (!e.is_private()
+                && !e.proactive
+                && match settings.group_mode.as_str() {
+                    "mention" => !e.mentioned,
+                    "keyword" => !e.mentioned && !keyword_hit,
+                    _ => false,
+                })
+        {
+            return Ok(());
+        };
+        if !self.store.claim_event(&e)? {
+            return Ok(());
+        }
+        let slot = self.queue.lock().await;
+        let senders = slot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("chat workers have not started"))?;
+        let index = e.shard(senders.len());
+        match senders[index].try_send(e.clone()) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.store.release_event(&e);
+                Err(anyhow::anyhow!("message queue is full: {err}"))
+            }
+        }
+    }
+    fn access(&self, e: &Event) -> Result<bool> {
+        let own = self.cfg.chat.owners.iter().any(|x| x == &e.sender);
+        let allowed = self.cfg.chat.allowed_sessions.is_empty()
+            || self.cfg.chat.allowed_sessions.contains(&e.session())
+            || own;
+        if !allowed {
+            self.store
+                .trace(&e.session(), "access_denied", "message ignored");
+            return Ok(false);
+        };
+        Ok(true)
+    }
+    async fn process(&self, mut e: Event) -> Result<()> {
+        let settings = self.settings.lock().await.clone();
+        let owner = self.cfg.chat.owners.iter().any(|x| x == &e.sender);
+        let permit = self.permit.clone().acquire_owned().await?;
+        let text = tokio::time::timeout(Duration::from_secs(45), self.prepare_text(&e))
+            .await
+            .map_err(|_| anyhow::anyhow!("voice recognition timed out"))??;
+        drop(permit);
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        e.text = truncate(&text, self.cfg.chat.max_input_chars);
+        self.store.trace(
+            &e.session(),
+            "message",
+            &format!("{}: {}", e.sender, e.text),
+        );
+        if !settings.enabled && !e.proactive {
+            if !(owner && e.is_private() && ["/active", "/status"].contains(&e.text.as_str())) {
+                return Ok(());
+            }
+        }
+        if settings.auto_memory {
+            let p = [
+                "喜欢",
+                "最爱",
+                "生日是",
+                "我叫",
+                "我的名字",
+                "记得我",
+                "我在",
+                "我住在",
+            ];
+            let n = ["讨厌", "不喜欢", "别再", "不要再"];
+            if p.iter().any(|x| e.text.contains(x)) {
+                self.store.affect(&e.session(), 0.35)
+            } else if n.iter().any(|x| e.text.contains(x)) {
+                self.store.affect(&e.session(), -0.35)
+            }
+        }
+        let mode = self.cfg.chat.session_models.get(&e.session());
+        let _ = mode;
+        if !self.cfg.chat.owners.is_empty() && owner && e.is_private() {
+            if e.text.starts_with("/remember ") {
+                if Store::permission_allowed(self.cfg.chat.memory_permission, owner, true) {
+                    self.store.add_memory(
+                        "*",
+                        &e.sender,
+                        &e.text[10..],
+                        3,
+                        settings.memory_limit,
+                    )?;
+                    self.send_text(&e, "已经记下了。").await?;
+                }
+                return Ok(());
+            }
+            if e.text == "/status" {
+                self.send_text(
+                    &e,
+                    if settings.enabled {
+                        "在线"
+                    } else {
+                        "暂停接话"
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            if e.text == "/silent" {
+                let mut x = self.settings.lock().await;
+                x.enabled = false;
+                self.store.set_settings(&x)?;
+                self.send_text(&e, "已安静下来。").await?;
+                return Ok(());
+            }
+            if e.text == "/active" {
+                let mut x = self.settings.lock().await;
+                x.enabled = true;
+                self.store.set_settings(&x)?;
+                self.send_text(&e, "我回来啦。").await?;
+                return Ok(());
+            }
+            if e.text.starts_with("/persona ") {
+                let name = e.text[9..].trim();
+                let ps = self.store.personas(&self.cfg.chat.personas)?;
+                if ps.contains_key(name) {
+                    self.store.set_session_persona(&e.session(), Some(name))?;
+                    self.send_text(&e, &format!("这个会话会使用「{name}」人格。"))
+                        .await?;
+                } else {
+                    self.send_text(&e, "找不到这个人格。").await?;
+                }
+                return Ok(());
+            }
+            if e.text == "/forget" {
+                self.store.forget_session(&e.session())?;
+                self.send_text(&e, "已清除当前会话的记忆和对话记录。")
+                    .await?;
+                return Ok(());
+            }
+        }
+        if !e.proactive
+            && !self
+                .store
+                .claim_cooldown(&e.session(), &e.sender, settings.cooldown_secs)?
+        {
+            self.store.trace(&e.session(), "rate_limited", &e.sender);
+            return Ok(());
+        }
+        if settings.dry_run && !e.proactive {
+            self.store.trace(
+                &e.session(),
+                "dry_run",
+                &format!("would answer: {}", e.text),
+            );
+            return Ok(());
+        }
+        let _p = self.permit.clone().acquire_owned().await?;
+        let reply = tokio::time::timeout(
+            Duration::from_secs(self.cfg.model.timeout_secs + 5),
+            self.model.reply(&self.cfg, &self.store, &e, &e.text),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("model response timed out"))??;
+        drop(_p);
+        let reply = truncate(&reply, self.cfg.chat.max_reply_chars);
+        if reply.trim().is_empty() {
+            return Ok(());
+        };
+        self.store
+            .record(&e, &e.text, &reply, settings.context_messages)?;
+        self.store.trace(&e.session(), "reply", &reply);
+        let (reply, sticker) = extract_sticker(&reply);
+        if let Some(id) = sticker {
+            if self.send_sticker(&e, id).await.is_err() {
+                self.store.trace(
+                    &e.session(),
+                    "sticker_fallback",
+                    "sticker was unavailable; continued with text",
+                );
+            }
+        }
+        let parts = crate::types::chunks(reply.trim(), 360, self.cfg.chat.max_reply_parts);
+        let mut first = true;
+        for part in parts {
+            if settings.voice_replies && self.cfg.voice.enabled && first {
+                if self.send_voice(&e, &part).await.is_ok() {
+                    first = false;
+                    continue;
+                }
+                self.store.trace(
+                    &e.session(),
+                    "voice_fallback",
+                    "TTS unavailable; using text",
+                );
+            }
+            self.send_text(&e, &part).await?;
+            first = false;
+        }
+        Ok(())
+    }
+    async fn prepare_text(&self, e: &Event) -> Result<String> {
+        let mut text = e.text.clone();
+        let mut transcripts = vec![];
+        for a in &e.attachments {
+            if a.sticker {
+                if self.cfg.chat.stickers && !a.url.is_empty() {
+                    let hash = hex::encode(sha2::Sha256::digest(a.url.as_bytes()));
+                    let _ = self.store.save_sticker(&e.sender, &hash, &a.url, &a.name);
+                }
+            } else if a.kind == "audio" {
+                match self.voice.transcribe(&self.cfg, a).await {
+                    Ok(t) => transcripts.push(t),
+                    Err(err) => self
+                        .store
+                        .trace(&e.session(), "asr_error", &err.to_string()),
+                }
+            } else if a.kind == "image" && self.cfg.model.vision {
+                let u = reqwest::Url::parse(&a.url)?;
+                if u.scheme() == "https"
+                    && self
+                        .cfg
+                        .voice
+                        .media_hosts
+                        .iter()
+                        .any(|h| h.eq_ignore_ascii_case(u.host_str().unwrap_or("")))
+                {
+                    text.push_str("\n[图片] ");
+                    text.push_str(&a.url);
+                }
+            }
+        }
+        for t in transcripts {
+            text.push_str("\n[语音识别] ");
+            text.push_str(&t);
+        }
+        Ok(text)
+    }
+    async fn send_text(&self, e: &Event, text: &str) -> Result<()> {
+        if self.settings.lock().await.dry_run && !e.proactive {
+            return Ok(());
+        }
+        match e.channel {
+            Channel::Onebot => {
+                let url = if e.scene == Scene::Group {
+                    "send_group_msg"
+                } else {
+                    "send_private_msg"
+                };
+                let body = if e.scene == Scene::Group {
+                    serde_json::json!({"group_id":e.target,"message":text})
+                } else {
+                    serde_json::json!({"user_id":e.target,"message":text})
+                };
+                let mut r = self
+                    .client
+                    .post(format!(
+                        "{}/{url}",
+                        self.cfg.onebot.http_url.trim_end_matches('/')
+                    ))
+                    .json(&body);
+                if !self.cfg.onebot.token_env.is_empty() {
+                    if let Ok(t) = std::env::var(&self.cfg.onebot.token_env) {
+                        r = r.bearer_auth(t)
+                    }
+                }
+                let res = r.send().await?;
+                if !res.status().is_success() {
+                    bail!("OneBot send failed: {}", res.status())
+                }
+            }
+            Channel::Official => {
+                if !e.proactive && now() - e.timestamp > self.cfg.official.reply_window_secs {
+                    bail!("QQ official passive reply window expired")
+                };
+                let url = match e.scene {
+                    Scene::Private => format!("/v2/users/{}/messages", e.target),
+                    Scene::Group => format!("/v2/groups/{}/messages", e.target),
+                    Scene::Guild => format!("/channels/{}/messages", e.target),
+                    Scene::GuildDm => format!("/dms/{}/messages", e.target),
+                };
+                let token = self.official_token().await?;
+                let mut b = serde_json::json!({"content":text,"msg_type":0});
+                if let Some(id) = &e.reply_to {
+                    b["msg_id"] = id.clone().into();
+                    b["msg_seq"] = 1.into();
+                }
+                let r = self
+                    .client
+                    .post(format!(
+                        "{}{}",
+                        self.cfg.official.base_url.trim_end_matches('/'),
+                        url
+                    ))
+                    .bearer_auth(token)
+                    .json(&b)
+                    .send()
+                    .await?;
+                if !r.status().is_success() {
+                    let status = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    bail!("QQ official send failed {status}: {}", truncate(&body, 200));
+                }
+            }
+            Channel::Panel => {}
+        }
+        Ok(())
+    }
+    async fn send_voice(&self, e: &Event, text: &str) -> Result<()> {
+        match e.channel {
+            Channel::Onebot => {
+                self.voice
+                    .send_onebot(
+                        &self.cfg,
+                        &self.client,
+                        &e.target,
+                        e.scene == Scene::Group,
+                        text,
+                    )
+                    .await
+            }
+            Channel::Official => {
+                if !["group", "private"].contains(&match e.scene {
+                    Scene::Group => "group",
+                    Scene::Private => "private",
+                    _ => "other",
+                }) {
+                    bail!("QQ official voice is supported in C2C/group only")
+                };
+                let audio = self.voice.synthesize(&self.cfg, text).await?;
+                if self.cfg.voice.tts_format != "opus" {
+                    bail!("QQ official bot requires Opus audio for voice upload")
+                };
+                let token = self.official_token().await?;
+                let (base, path) = match e.scene {
+                    Scene::Private => (
+                        &self.cfg.official.base_url,
+                        format!("/v2/users/{}/files", e.target),
+                    ),
+                    Scene::Group => (
+                        &self.cfg.official.base_url,
+                        format!("/v2/groups/{}/files", e.target),
+                    ),
+                    _ => unreachable!(),
+                };
+                let upload=self.client.post(format!("{}{}",base.trim_end_matches('/'),path)).bearer_auth(&token).json(&serde_json::json!({"file_type":3,"srv_send_msg":false,"file_data":base64::Engine::encode(&base64::engine::general_purpose::STANDARD,&audio)})).send().await?;
+                let status = upload.status();
+                let v: Value = upload.json().await?;
+                if !status.is_success() {
+                    bail!("QQ voice upload failed: {status}")
+                };
+                let info = v["file_info"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("QQ voice upload returned no file_info"))?;
+                let url = if e.scene == Scene::Private {
+                    format!("/v2/users/{}/messages", e.target)
+                } else {
+                    format!("/v2/groups/{}/messages", e.target)
+                };
+                let mut body =
+                    serde_json::json!({"msg_type":7,"media":{"file_info":info},"msg_seq":1});
+                if let Some(id) = &e.reply_to {
+                    body["msg_id"] = id.clone().into();
+                    body["msg_seq"] = 1.into();
+                }
+                let send = self
+                    .client
+                    .post(format!("{}{url}", base.trim_end_matches('/')))
+                    .bearer_auth(token)
+                    .json(&body)
+                    .send()
+                    .await?;
+                if !send.status().is_success() {
+                    bail!("QQ official voice send failed: {}", send.status())
+                };
+                Ok(())
+            }
+            Channel::Panel => Ok(()),
+        }
+    }
+    async fn send_sticker(&self, e: &Event, id: i64) -> Result<()> {
+        let Some((_source, url, _name)) = self.store.sticker(id)? else {
+            bail!("unknown sticker")
+        };
+        match e.channel {
+            Channel::Onebot => {
+                let path = if e.scene == Scene::Group {
+                    "send_group_msg"
+                } else {
+                    "send_private_msg"
+                };
+                let body = if e.scene == Scene::Group {
+                    serde_json::json!({"group_id":e.target,"message":[{"type":"image","data":{"file":url}}]})
+                } else {
+                    serde_json::json!({"user_id":e.target,"message":[{"type":"image","data":{"file":url}}]})
+                };
+                let response = self
+                    .client
+                    .post(format!(
+                        "{}/{path}",
+                        self.cfg.onebot.http_url.trim_end_matches('/')
+                    ))
+                    .json(&body)
+                    .send()
+                    .await?;
+                if !response.status().is_success() {
+                    bail!("OneBot sticker send failed")
+                }
+            }
+            Channel::Official => {
+                let token = self.official_token().await?;
+                let path = match e.scene {
+                    Scene::Private => format!("/v2/users/{}/files", e.target),
+                    Scene::Group => format!("/v2/groups/{}/files", e.target),
+                    _ => bail!("stickers are not supported in this QQ scene"),
+                };
+                let r = self
+                    .client
+                    .post(format!(
+                        "{}{}",
+                        self.cfg.official.base_url.trim_end_matches('/'),
+                        path
+                    ))
+                    .bearer_auth(&token)
+                    .json(&serde_json::json!({"file_type":1,"srv_send_msg":false,"url":url}))
+                    .send()
+                    .await?;
+                let status = r.status();
+                let v: Value = r.json().await?;
+                if !status.is_success() {
+                    bail!("QQ sticker upload failed")
+                };
+                let info = v["file_info"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("QQ sticker upload has no file_info"))?;
+                let path = if e.scene == Scene::Private {
+                    format!("/v2/users/{}/messages", e.target)
+                } else {
+                    format!("/v2/groups/{}/messages", e.target)
+                };
+                let r=self.client.post(format!("{}{}",self.cfg.official.base_url.trim_end_matches('/'),path)).bearer_auth(token).json(&serde_json::json!({"msg_type":7,"media":{"file_info":info},"msg_id":e.reply_to,"msg_seq":1})).send().await?;
+                if !r.status().is_success() {
+                    bail!("QQ sticker send failed")
+                }
+            }
+            Channel::Panel => {}
+        }
+        self.store.use_sticker(id)?;
+        Ok(())
+    }
+    async fn official_token(&self) -> Result<String> {
+        if let Some((token, expiry)) = OFFICIAL_TOKEN.lock().await.clone() {
+            if expiry > now() + 60 {
+                return Ok(token);
+            }
+        }
+        let secret = crate::config::secret(&self.cfg.official.secret_env)?;
+        let response = self
+            .client
+            .post(&self.cfg.official.token_url)
+            .json(&serde_json::json!({"appId":self.cfg.official.app_id,"clientSecret":secret}))
+            .send()
+            .await?;
+        let status = response.status();
+        let v: Value = response.json().await?;
+        if !status.is_success() {
+            bail!("QQ token endpoint returned {status}")
+        };
+        let token = v["access_token"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("QQ token response has no access_token"))?
+            .to_string();
+        let exp = now() + v["expires_in"].as_i64().unwrap_or(7200);
+        *OFFICIAL_TOKEN.lock().await = Some((token.clone(), exp));
+        Ok(token)
+    }
+}
+static OFFICIAL_TOKEN: tokio::sync::Mutex<Option<(String, i64)>> =
+    tokio::sync::Mutex::const_new(None);
+pub async fn run_scheduler(engine: Engine, stop: CancellationToken) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tokio::select! {_=stop.cancelled()=>break,_=tick.tick()=>{let s=engine.settings.lock().await.clone();if !s.enabled||!s.proactive{continue}let local=(chrono::Utc::now().timestamp()+i64::from(s.utc_offset_hours)*3600).rem_euclid(86400) as u32/3600;if !(s.awake_start<=local&&local<s.awake_end)||s.proactive_sessions.is_empty(){continue}let Ok(sessions)=engine.store.sessions(500).and_then(|xs|Ok(xs.into_iter().filter(|x|s.proactive_sessions.contains(&x.key)).collect::<Vec<_>>()))else{continue};for sess in sessions{let last=engine.store.history(&Event{id:"scheduler".into(),channel:if sess.channel=="official"{Channel::Official}else{Channel::Onebot},scene:match sess.scene.as_str(){"private"=>Scene::Private,"group"=>Scene::Group,"guild"=>Scene::Guild,_=>Scene::GuildDm},target:sess.target.clone(),sender:String::new(),sender_name:String::new(),text:String::new(),mentioned:false,timestamp:now(),attachments:vec![],reply_to:None,proactive:true},1).unwrap_or_default();if last.first().is_some_and(|m|now()-m.timestamp<s.proactive_interval_minutes*60){continue}let owners=&engine.cfg.chat.owners;let e=Event{id:uuid::Uuid::new_v4().to_string(),channel:if sess.channel=="official"{Channel::Official}else{Channel::Onebot},scene:match sess.scene.as_str(){"private"=>Scene::Private,"group"=>Scene::Group,"guild"=>Scene::Guild,_=>Scene::GuildDm},target:sess.target,sender:owners.first().cloned().unwrap_or_default(),sender_name:String::new(),text:"请自然地主动和主人聊几句，结合我们最近的聊天，但不要重复刚才的话。".into(),mentioned:false,timestamp:now(),attachments:vec![],reply_to:None,proactive:true};if let Err(err)=engine.process(e.clone()).await{engine.store.trace(&e.session(),"scheduler_error",&err.to_string());}}}}
+    }
+}
+pub async fn worker_loop(engine: Engine, mut rx: mpsc::Receiver<Event>) {
+    let mut pending = VecDeque::new();
+    loop {
+        let mut e = match pending.pop_front() {
+            Some(e) => e,
+            None => match rx.recv().await {
+                Some(e) => e,
+                None => break,
+            },
+        };
+        if e.scene == Scene::Group && engine.cfg.chat.group_debounce_ms > 0 {
+            sleep(Duration::from_millis(engine.cfg.chat.group_debounce_ms)).await;
+            while let Ok(next) = rx.try_recv() {
+                pending.push_back(next)
+            }
+            let mut rest = VecDeque::new();
+            while let Some(next) = pending.pop_front() {
+                if next.session() == e.session() {
+                    e.text
+                        .push_str(&format!("\n{}: {}", next.sender_name, next.text));
+                    e.attachments.extend(next.attachments);
+                } else {
+                    rest.push_back(next)
+                }
+            }
+            pending = rest;
+        }
+        if let Err(err) = engine.process(e.clone()).await {
+            engine
+                .store
+                .trace(&e.session(), "handler_error", &err.to_string());
+        }
+    }
+}
+fn extract_sticker(text: &str) -> (String, Option<i64>) {
+    let Some(start) = text.rfind("[[sticker:") else {
+        return (text.to_owned(), None);
+    };
+    let Some(end_rel) = text[start..].find("]]") else {
+        return (text.to_owned(), None);
+    };
+    let end = start + end_rel + 2;
+    let id = text[start + 10..end - 2].trim().parse::<i64>().ok();
+    let mut clean = text.to_owned();
+    clean.replace_range(start..end, " ");
+    (clean, id)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Permission;
+    #[test]
+    fn permission_is_denied_for_group_by_default() {
+        assert!(!Store::permission_allowed(
+            Permission::OwnerPrivate,
+            true,
+            false
+        ));
+    }
+    #[test]
+    fn sticker_marker_is_removed_and_parsed() {
+        let (text, id) = extract_sticker("Here [[sticker:42]] now");
+        assert_eq!(id, Some(42));
+        assert_eq!(text, "Here   now");
+        assert_eq!(extract_sticker("no marker").1, None);
+    }
+}
