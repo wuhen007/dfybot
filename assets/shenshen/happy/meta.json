@@ -1,0 +1,24 @@
+{
+  "fps": 24.0,
+  "frames": 241,
+  "size": [
+    216,
+    232
+  ],
+  "source_clip": "anim/random/工作状态-雀跃庆祝",
+  "source_meta": {
+    "fps": 24.0,
+    "source": "工作状态-雀跃庆祝.webm",
+    "frames": 241,
+    "encoder": "libwebp lossless (bgra straight, unblend-white-v6)",
+    "unblend": "white-v6",
+    "source_sha256": "3ff681051a0bb4f152d7535d64b7f3194c30298bf56d41e521216a278f135d3e",
+    "content_sha": "cdc1d67bb836c4217e4eeb0c098a3b817b6ad8a3b5a25e4e9ce1654af2a0eee0"
+  },
+  "crop": [
+    150,
+    8,
+    478,
+    360
+  ]
+}

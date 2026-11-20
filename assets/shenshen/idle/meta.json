@@ -1,0 +1,24 @@
+{
+  "fps": 24.0,
+  "frames": 241,
+  "size": [
+    216,
+    232
+  ],
+  "source_clip": "anim/idle/待机呼吸休闲",
+  "source_meta": {
+    "fps": 24.0,
+    "source": "待机呼吸休闲.webm",
+    "frames": 241,
+    "encoder": "libwebp lossless (bgra straight, unblend-white-v6)",
+    "unblend": "white-v6",
+    "source_sha256": "deb965d05a85dacf5ff4a20faa757846f0d11679598c3ec578a5571487660395",
+    "content_sha": "ee8961863828a188d2540b3ee88139522a0933ddb85759ca60240af33b650994"
+  },
+  "crop": [
+    150,
+    8,
+    478,
+    360
+  ]
+}

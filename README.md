@@ -79,7 +79,9 @@ cargo build --release --features desktop-pet --bin aurabot-pet
 .\target\release\aurabot-pet.exe --server http://127.0.0.1:8788 --token-file data/admin.token
 ```
 
-The client polls the authenticated `/api/pet/state` endpoint every three seconds and only receives aggregate owner-session mood/activity, not messages. Local HTTP is accepted only for loopback addresses; remote server URLs require HTTPS. The floating window is transparent, draggable and always on top. Right-click it to exit.
+The client polls the authenticated `/api/pet/state` endpoint every three seconds and only receives aggregate owner-session mood/activity, not messages. Its six state animations use cropped frames from the user's installed Shenshen character; see [asset selection and license](assets/shenshen/README.md). Only the active animation's compressed frames and one texture are kept in memory; playback runs at 24 fps. Local HTTP is accepted only for loopback addresses; remote server URLs require HTTPS. The floating window is transparent, draggable and always on top. Right-click it to exit.
+
+Run the command above from the repository root. For a portable installation, copy `assets/shenshen` beside the executable, keeping the `assets/shenshen` directory structure and license. The client looks beside its executable first, then in the current directory. Use `--assets-dir "path/to/assets/shenshen"` to select a different location. Missing or invalid frames produce a loading error rather than silently truncating an animation.
 
 ## License
 

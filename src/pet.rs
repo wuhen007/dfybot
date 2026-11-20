@@ -1,13 +1,19 @@
+#![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
+
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use eframe::egui::{self, Color32, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use reqwest::Client;
 use serde::Deserialize;
 use std::{
+    io::Cursor,
     path::PathBuf,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+const FRAME_RATE: f64 = 24.0;
+const FRAME_SIZE: [usize; 2] = [216, 232];
 
 #[derive(Parser)]
 #[command(
@@ -21,6 +27,9 @@ struct Args {
     token_env: String,
     #[arg(long, default_value = "data/admin.token")]
     token_file: PathBuf,
+    /// Directory containing the six Shenshen state animation folders.
+    #[arg(long)]
+    assets_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,6 +78,8 @@ fn main() -> Result<()> {
         .filter(|value| value.len() >= 24)
         .context("set the management token environment variable or provide --token-file")?;
     let state = Arc::new(RwLock::new(PetState::default()));
+    let assets_dir = asset_directory(args.assets_dir)?;
+    let app = PetApp::new(state.clone(), assets_dir)?;
     spawn_poll(args.server, token, state.clone())?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -92,7 +103,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "Aurabot Pet",
         options,
-        Box::new(move |_cc| Ok(Box::new(PetApp::new(state)))),
+        Box::new(move |_cc| Ok(Box::new(app))),
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
@@ -148,119 +159,186 @@ fn spawn_poll(server: String, token: String, state: Arc<RwLock<PetState>>) -> Re
 
 struct PetApp {
     state: Arc<RwLock<PetState>>,
-    animation_time: f32,
+    assets_dir: PathBuf,
+    animation_started: Instant,
+    animation: String,
+    frames: Vec<Vec<u8>>,
+    texture: Option<TextureHandle>,
+    rendered_frame: Option<usize>,
+    asset_error: bool,
     bubble_open: bool,
 }
 
 impl PetApp {
-    fn new(state: Arc<RwLock<PetState>>) -> Self {
-        Self {
+    fn new(state: Arc<RwLock<PetState>>, assets_dir: PathBuf) -> Result<Self> {
+        let frames = load_frames(&assets_dir, "offline")?;
+        decode_frame(&frames[0])?;
+        Ok(Self {
             state,
-            animation_time: 0.0,
+            assets_dir,
+            animation_started: Instant::now(),
+            animation: "offline".into(),
+            frames,
+            texture: None,
+            rendered_frame: None,
+            asset_error: false,
             bubble_open: true,
+        })
+    }
+
+    fn paint_character(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        rect: Rect,
+        state: &PetState,
+    ) {
+        let animation = animation_for(state);
+        if self.animation != animation {
+            self.frames.clear();
+            self.frames = match load_frames(&self.assets_dir, animation) {
+                Ok(frames) => {
+                    self.asset_error = false;
+                    frames
+                }
+                Err(error) => {
+                    eprintln!("Failed to load {animation}: {error:#}");
+                    self.asset_error = true;
+                    Vec::new()
+                }
+            };
+            self.animation = animation.to_owned();
+            self.animation_started = Instant::now();
+            self.rendered_frame = None;
+        }
+        let index = (self.animation_started.elapsed().as_secs_f64() * FRAME_RATE) as usize
+            % self.frames.len().max(1);
+        let Some(frame) = self.frames.get(index) else {
+            return;
+        };
+        if self.rendered_frame != Some(index) {
+            let image = match decode_frame(frame) {
+                Ok(image) => image,
+                Err(error) => {
+                    eprintln!("Failed to decode {animation} frame {index}: {error:#}");
+                    self.asset_error = true;
+                    return;
+                }
+            };
+            if let Some(texture) = self.texture.as_mut() {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            } else {
+                self.texture =
+                    Some(ctx.load_texture("aurabot-pet", image, egui::TextureOptions::LINEAR));
+            }
+            self.rendered_frame = Some(index);
+        }
+        if let Some(texture) = &self.texture {
+            painter.image(
+                texture.id(),
+                Rect::from_center_size(
+                    Pos2::new(rect.center().x, rect.top() + 196.0),
+                    Vec2::new(FRAME_SIZE[0] as f32, FRAME_SIZE[1] as f32),
+                ),
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
         }
     }
 
-    fn paint_fish(&self, painter: &egui::Painter, rect: Rect, state: &PetState) {
-        let center = Pos2::new(rect.center().x, rect.top() + 207.0);
-        let mood = state.mood.clamp(-5.0, 5.0);
-        let body = if mood > 0.8 {
-            Color32::from_rgb(69, 187, 157)
-        } else if mood < -0.8 {
-            Color32::from_rgb(103, 164, 177)
-        } else {
-            Color32::from_rgb(83, 190, 176)
-        };
-        let outline = Color32::from_rgb(34, 113, 112);
-        let wag = self.animation_time.sin()
-            * if state.activity == "thinking" {
-                12.0
-            } else {
-                7.0
-            };
-        let body_rx = 83.0;
-        let body_ry = 57.0;
-        let tail_root = Pos2::new(center.x + 69.0, center.y + 4.0);
-        let tail_tip = Pos2::new(center.x + 112.0, center.y + wag);
-        let tail_upper = Pos2::new(center.x + 91.0, center.y - 29.0 + wag * 0.25);
-        let tail_lower = Pos2::new(center.x + 91.0, center.y + 35.0 + wag * 0.25);
-        painter.add(Shape::convex_polygon(
-            vec![tail_root, tail_upper, tail_tip, tail_lower],
-            Color32::from_rgb(238, 130, 115),
-            Stroke::new(3.0, outline),
-        ));
-
-        let body_points: Vec<Pos2> = (0..48)
-            .map(|step| {
-                let angle = std::f32::consts::TAU * step as f32 / 48.0;
-                Pos2::new(
-                    center.x + body_rx * angle.cos(),
-                    center.y + body_ry * angle.sin(),
-                )
-            })
-            .collect();
-        painter.add(Shape::convex_polygon(
-            body_points,
-            body,
-            Stroke::new(3.0, outline),
-        ));
-
-        painter.add(Shape::convex_polygon(
-            vec![
-                Pos2::new(center.x - 4.0, center.y + 35.0),
-                Pos2::new(center.x + 22.0, center.y + 53.0),
-                Pos2::new(center.x + 41.0, center.y + 34.0),
-            ],
-            Color32::from_rgb(243, 197, 96),
-            Stroke::new(2.0, outline),
-        ));
-        painter.add(Shape::convex_polygon(
-            vec![
-                Pos2::new(center.x - 24.0, center.y - 37.0),
-                Pos2::new(center.x - 5.0, center.y - 56.0),
-                Pos2::new(center.x + 14.0, center.y - 39.0),
-            ],
-            Color32::from_rgb(239, 151, 136),
-            Stroke::new(2.0, outline),
-        ));
-
-        painter.circle_filled(
-            Pos2::new(center.x - 34.0, center.y - 12.0),
-            13.0,
-            Color32::from_rgba_unmultiplied(255, 236, 197, 150),
-        );
-        painter.circle_filled(
-            Pos2::new(center.x - 18.0, center.y - 5.0),
-            4.8,
-            Color32::WHITE,
-        );
-        painter.circle_filled(
-            Pos2::new(center.x - 16.0, center.y - 5.0),
-            2.5,
-            Color32::from_rgb(38, 66, 72),
-        );
-        painter.circle_filled(
-            Pos2::new(center.x - 29.0, center.y + 8.0),
-            7.0,
-            Color32::from_rgba_unmultiplied(239, 116, 126, 105),
-        );
-        painter.circle_filled(
-            Pos2::new(center.x + 76.0, center.y - 49.0 + wag * 0.1),
-            4.0,
-            Color32::from_rgb(244, 197, 96),
-        );
-    }
-
     fn mood_line(state: &PetState) -> String {
+        if !state.connected || state.activity == "offline" {
+            return "等服务器连接".into();
+        }
+        if !state.chat_enabled {
+            return "今天先安静陪伴".into();
+        }
         match state.activity.as_str() {
             "sleeping" => "正在休息".into(),
             "thinking" => "正在陪你聊天".into(),
-            "offline" => "等服务器连接".into(),
-            _ if !state.chat_enabled => "今天先安静陪伴".into(),
             _ if state.proactive_enabled => format!("{} · 会主动找你", state.mood_label),
             _ => format!("{} · 陪你待着", state.mood_label),
         }
     }
+}
+
+fn animation_for(state: &PetState) -> &'static str {
+    if !state.connected {
+        "offline"
+    } else if !state.chat_enabled {
+        "waiting"
+    } else {
+        match state.activity.as_str() {
+            "sleeping" => "sleeping",
+            "thinking" => "thinking",
+            "offline" => "offline",
+            _ if state.mood > 0.8 => "happy",
+            _ => "idle",
+        }
+    }
+}
+
+fn asset_directory(requested: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(directory) = requested {
+        return Ok(directory);
+    }
+    let executable = std::env::current_exe()?;
+    let adjacent = executable
+        .parent()
+        .context("executable has no parent")?
+        .join("assets/shenshen");
+    if adjacent.is_dir() {
+        return Ok(adjacent);
+    }
+    Ok(std::env::current_dir()?.join("assets/shenshen"))
+}
+
+fn load_frames(root: &std::path::Path, animation: &str) -> Result<Vec<Vec<u8>>> {
+    #[derive(Deserialize)]
+    struct Meta {
+        frames: usize,
+        fps: f64,
+        size: [usize; 2],
+    }
+    let directory = root.join(animation);
+    let meta: Meta = serde_json::from_slice(
+        &std::fs::read(directory.join("meta.json")).with_context(|| {
+            format!(
+                "missing animation metadata in {}; use --assets-dir",
+                directory.display()
+            )
+        })?,
+    )?;
+    if !(1..=1000).contains(&meta.frames) || meta.fps != FRAME_RATE || meta.size != FRAME_SIZE {
+        bail!("unsupported animation metadata in {}", directory.display());
+    }
+    (1..=meta.frames)
+        .map(|index| {
+            let path = directory.join(format!("f_{index:04}.png"));
+            std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))
+        })
+        .collect()
+}
+
+fn decode_frame(bytes: &[u8]) -> Result<egui::ColorImage> {
+    let mut reader = png::Decoder::new(Cursor::new(bytes)).read_info()?;
+    let header = reader.info();
+    if [header.width as usize, header.height as usize] != FRAME_SIZE
+        || header.color_type != png::ColorType::Rgba
+        || header.bit_depth != png::BitDepth::Eight
+    {
+        bail!("expected a 216x232 RGBA8 PNG frame");
+    }
+    let size = reader
+        .output_buffer_size()
+        .context("PNG frame exceeds the supported output size")?;
+    let mut buffer = vec![0; size];
+    let info = reader.next_frame(&mut buffer)?;
+    let size = [info.width as usize, info.height as usize];
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        &buffer[..info.buffer_size()],
+    ))
 }
 
 impl eframe::App for PetApp {
@@ -270,8 +348,6 @@ impl eframe::App for PetApp {
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
-        let dt = ctx.input(|input| input.stable_dt).clamp(0.0, 0.1);
-        self.animation_time = (self.animation_time + dt * 3.5) % std::f32::consts::TAU;
         let state = self.state.read().map(|s| s.clone()).unwrap_or_default();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -291,6 +367,7 @@ impl eframe::App for PetApp {
                     }
                 });
                 let painter = ui.painter_at(rect);
+                self.paint_character(&ctx, &painter, rect, &state);
                 if self.bubble_open {
                     let bubble = Rect::from_min_size(
                         Pos2::new(rect.left() + 13.0, rect.top() + 16.0),
@@ -317,12 +394,15 @@ impl eframe::App for PetApp {
                     painter.text(
                         Pos2::new(bubble.left() + 13.0, bubble.top() + 34.0),
                         egui::Align2::LEFT_TOP,
-                        Self::mood_line(&state),
+                        if self.asset_error {
+                            "素材加载失败，请检查资源目录".into()
+                        } else {
+                            Self::mood_line(&state)
+                        },
                         egui::FontId::proportional(12.5),
                         Color32::from_rgb(89, 112, 113),
                     );
                 }
-                self.paint_fish(&painter, rect, &state);
                 painter.text(
                     Pos2::new(rect.right() - 13.0, rect.bottom() - 16.0),
                     egui::Align2::RIGHT_BOTTOM,
@@ -331,6 +411,69 @@ impl eframe::App for PetApp {
                     Color32::from_rgb(101, 126, 124),
                 );
             });
-        ctx.request_repaint_after(Duration::from_millis(33));
+        let interval = 1.0 / FRAME_RATE;
+        let remaining = interval - self.animation_started.elapsed().as_secs_f64() % interval;
+        ctx.request_repaint_after(Duration::from_secs_f64(remaining));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn animation_matches_connection_and_bot_state() {
+        let mut state = PetState::default();
+        assert_eq!(animation_for(&state), "offline");
+        state.connected = true;
+        assert_eq!(animation_for(&state), "waiting");
+        state.chat_enabled = true;
+        state.activity = "idle".into();
+        assert_eq!(animation_for(&state), "idle");
+        state.activity = "sleeping".into();
+        assert_eq!(animation_for(&state), "sleeping");
+        state.activity = "thinking".into();
+        assert_eq!(animation_for(&state), "thinking");
+        state.activity = "idle".into();
+        state.mood = 1.0;
+        assert_eq!(animation_for(&state), "happy");
+    }
+
+    #[test]
+    fn selected_animation_frames_decode() {
+        for name in [
+            "idle", "sleeping", "thinking", "offline", "happy", "waiting",
+        ] {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shenshen");
+            let frames = load_frames(&root, name).expect("complete animation");
+            for frame in frames {
+                let decoded = decode_frame(&frame).expect("valid PNG");
+                assert_eq!(decoded.size, FRAME_SIZE);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_frames_are_reported_instead_of_truncating_animation() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("offline");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("meta.json"),
+            r#"{"frames":2,"fps":24,"size":[216,232]}"#,
+        )
+        .unwrap();
+        std::fs::write(directory.join("f_0001.png"), b"placeholder").unwrap();
+        assert!(
+            load_frames(root.path(), "offline")
+                .unwrap_err()
+                .to_string()
+                .contains("f_0002.png")
+        );
+    }
+
+    #[test]
+    fn malformed_frames_are_rejected() {
+        assert!(decode_frame(b"not a PNG").is_err());
     }
 }

@@ -7,7 +7,7 @@ description = "Standalone Rust QQ companion server: OneBot and QQ official bot"
 
 [features]
 default = []
-desktop-pet = ["dep:eframe"]
+desktop-pet = ["dep:eframe", "dep:png"]
 
 [[bin]]
 name = "aurabot"
@@ -28,6 +28,7 @@ ed25519-dalek = "2"
 eframe = { version = "0.37", optional = true, default-features = false, features = ["default_fonts", "system_fonts", "glow"] }
 futures-util = "0.3"
 hex = "0.4"
+png = { version = "0.18", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled", "backup", "serialize"] }
 serde = { version = "1", features = ["derive"] }

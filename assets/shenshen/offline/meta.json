@@ -1,0 +1,24 @@
+{
+  "fps": 24.0,
+  "frames": 118,
+  "size": [
+    216,
+    232
+  ],
+  "source_clip": "anim/random/工作状态-垂头叹气冒汗",
+  "source_meta": {
+    "fps": 24.0,
+    "source": "工作状态-垂头叹气冒汗.webm",
+    "frames": 118,
+    "encoder": "libwebp lossless (bgra straight, unblend-white-v6)",
+    "unblend": "white-v6",
+    "source_sha256": "ab00c844e62221905574b4c070e0d7b6fa14fb2afa1064c27a160f10e25f7196",
+    "content_sha": "d1f8141cc8ed13f39c3d0097f4bd0ba1679c2cc6cd421b12ceb59c9a661c927d"
+  },
+  "crop": [
+    150,
+    8,
+    478,
+    360
+  ]
+}

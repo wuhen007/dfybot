@@ -1,0 +1,24 @@
+{
+  "fps": 24.0,
+  "frames": 241,
+  "size": [
+    216,
+    232
+  ],
+  "source_clip": "anim/random/原地小憩沉眠",
+  "source_meta": {
+    "fps": 24.0,
+    "source": "原地小憩沉眠.webm",
+    "frames": 241,
+    "encoder": "libwebp lossless (bgra straight, unblend-white-v6)",
+    "unblend": "white-v6",
+    "source_sha256": "31d4a6b36a29b2a4fe097384173d3bbeb3fa2f40f526b13191791456bf7507a1",
+    "content_sha": "3f4fed05525c80812dad53df86a6df0c005414f714154bae72bf082b0548c271"
+  },
+  "crop": [
+    150,
+    8,
+    478,
+    360
+  ]
+}

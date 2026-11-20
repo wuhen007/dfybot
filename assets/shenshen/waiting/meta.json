@@ -1,0 +1,24 @@
+{
+  "fps": 24.0,
+  "frames": 241,
+  "size": [
+    216,
+    232
+  ],
+  "source_clip": "anim/turn/东张西望",
+  "source_meta": {
+    "fps": 24.0,
+    "source": "东张西望.webm",
+    "frames": 241,
+    "encoder": "libwebp lossless (bgra straight, unblend-white-v6)",
+    "unblend": "white-v6",
+    "source_sha256": "a20ed02ccc5e72075a3ca83fabb57d9aac5ded699f52d00ec6de72069799fcd5",
+    "content_sha": "7d7a9574453fbe5ea7ace62c39f7b8303019c2aeec2890879d1689c1c4d781a8"
+  },
+  "crop": [
+    150,
+    8,
+    478,
+    360
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "fps": 24.0,
+  "frames": 241,
+  "size": [
+    216,
+    232
+  ],
+  "source_clip": "anim/random/工作状态-思考冒泡",
+  "source_meta": {
+    "fps": 24.0,
+    "source": "工作状态-思考冒泡.webm",
+    "frames": 241,
+    "encoder": "libwebp lossless (bgra straight, unblend-white-v6)",
+    "unblend": "white-v6",
+    "source_sha256": "b4a36cfa28ea5d7089e362a01972c6e880297c6dcd0d39f1994efd889a3c1be5",
+    "content_sha": "90655023cdc9c8605d110fd88a7a7bb1731d045d6adec38b227e1b39b5030aa9"
+  },
+  "crop": [
+    150,
+    8,
+    478,
+    360
+  ]
+}
