@@ -3,6 +3,7 @@ use crate::{
     types::Attachment,
 };
 use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::Value;
 use std::{process::Stdio, time::Duration};
@@ -71,16 +72,19 @@ impl VoiceClient {
         {
             bail!("voice URL host is not in voice.media_hosts")
         }
-        let response = self.http.get(u).send().await?;
-        let len = response.content_length().unwrap_or(0) as usize;
-        if len > c.voice.max_bytes {
+        let response = self.http.get(u).send().await?.error_for_status()?;
+        if response
+            .content_length()
+            .is_some_and(|len| len > c.voice.max_bytes as u64)
+        {
             bail!("voice attachment is too large")
         };
-        let bytes = response.bytes().await?;
-        if bytes.len() > c.voice.max_bytes {
-            bail!("voice attachment is too large")
-        };
-        Ok(bytes.to_vec())
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            append_limited(&mut bytes, &chunk?, c.voice.max_bytes)?;
+        }
+        Ok(bytes)
     }
     pub async fn synthesize(&self, c: &Config, text: &str) -> Result<Vec<u8>> {
         if !c.voice.enabled {
@@ -218,6 +222,15 @@ pub fn audio_segment(v: &Value) -> Option<Attachment> {
         sticker: false,
     })
 }
+
+fn append_limited(output: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> Result<()> {
+    if chunk.len() > max_bytes.saturating_sub(output.len()) {
+        bail!("voice attachment is too large")
+    }
+    output.extend_from_slice(chunk);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +245,13 @@ mod tests {
             audio_segment(&serde_json::json!({"type":"image","data":{"url":"https://x"}}))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn streamed_audio_obeys_size_limit_across_chunks() {
+        let mut output = Vec::new();
+        append_limited(&mut output, b"123", 5).unwrap();
+        assert!(append_limited(&mut output, b"456", 5).is_err());
+        assert_eq!(output, b"123");
     }
 }

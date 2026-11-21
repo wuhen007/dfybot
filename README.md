@@ -1,5 +1,7 @@
 # Aurabot Rust
 
+[Simplified Chinese](README.zh-CN.md)
+
 Aurabot Rust is a standalone, single-process QQ companion server. It does not load DeepSeek Harness. OneBot v11 and the QQ Open Platform feed a shared, channel-aware conversation engine. The first release scope excludes QQ Space, Bilibili, image generation/local arbitrary HTTP integrations and a third-party module marketplace. It also excludes song covers: voice input uses ASR and spoken replies use TTS.
 
 ## Current state
