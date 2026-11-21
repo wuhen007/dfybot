@@ -1,20 +1,20 @@
 [package]
-name = "aurabot"
+name = "dfybot"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Standalone Rust QQ companion server: OneBot and QQ official bot"
+description = "dfyBOT standalone Rust QQ bot: OneBot and QQ official bot"
 
 [features]
 default = []
 desktop-pet = ["dep:eframe", "dep:png"]
 
 [[bin]]
-name = "aurabot"
+name = "dfybot"
 path = "src/main.rs"
 
 [[bin]]
-name = "aurabot-pet"
+name = "dfybot-pet"
 path = "src/pet.rs"
 required-features = ["desktop-pet"]
 

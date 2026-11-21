@@ -17,8 +17,8 @@ const FRAME_SIZE: [usize; 2] = [216, 232];
 
 #[derive(Parser)]
 #[command(
-    name = "aurabot-pet",
-    about = "Optional floating desktop pet for Aurabot"
+    name = "dfybot-pet",
+    about = "Optional floating desktop pet for dfyBOT"
 )]
 struct Args {
     #[arg(long, default_value = "http://127.0.0.1:8788")]
@@ -83,8 +83,8 @@ fn main() -> Result<()> {
     spawn_poll(args.server, token, state.clone())?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Aurabot Pet")
-            .with_app_id("aurabot-pet")
+            .with_title("dfyBOT 桌宠")
+            .with_app_id("dfybot-pet")
             .with_inner_size([276.0, 320.0])
             .with_min_inner_size([240.0, 280.0])
             .with_max_inner_size([276.0, 320.0])
@@ -101,7 +101,7 @@ fn main() -> Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Aurabot Pet",
+        "dfyBOT 桌宠",
         options,
         Box::new(move |_cc| Ok(Box::new(app))),
     )
@@ -114,7 +114,7 @@ fn spawn_poll(server: String, token: String, state: Arc<RwLock<PetState>>) -> Re
         .pool_max_idle_per_host(1)
         .build()?;
     std::thread::Builder::new()
-        .name("aurabot-pet-status".into())
+        .name("dfybot-pet-status".into())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -229,7 +229,7 @@ impl PetApp {
                 texture.set(image, egui::TextureOptions::LINEAR);
             } else {
                 self.texture =
-                    Some(ctx.load_texture("aurabot-pet", image, egui::TextureOptions::LINEAR));
+                    Some(ctx.load_texture("dfybot-pet", image, egui::TextureOptions::LINEAR));
             }
             self.rendered_frame = Some(index);
         }

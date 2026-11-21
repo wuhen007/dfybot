@@ -541,7 +541,7 @@ async fn backup(State(s): State<AppState>) -> Result<Response, ApiError> {
     );
     r.headers_mut().insert(
         axum::http::header::CONTENT_DISPOSITION,
-        HeaderValue::from_static("attachment; filename=aurabot-backup.sqlite"),
+        HeaderValue::from_static("attachment; filename=dfybot-backup.sqlite"),
     );
     Ok(r)
 }

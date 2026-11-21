@@ -1,8 +1,8 @@
-# Aurabot Rust
+# dfyBOT
 
 [Simplified Chinese](README.zh-CN.md)
 
-Aurabot Rust is a standalone, single-process QQ companion server. It does not load DeepSeek Harness. OneBot v11 and the QQ Open Platform feed a shared, channel-aware conversation engine. The first release scope excludes QQ Space, Bilibili, image generation/local arbitrary HTTP integrations and a third-party module marketplace. It also excludes song covers: voice input uses ASR and spoken replies use TTS.
+dfyBOT is a standalone, single-process QQ companion server. It does not load DeepSeek Harness. OneBot v11 and the QQ Open Platform feed a shared, channel-aware conversation engine. The first release scope excludes QQ Space, Bilibili, image generation/local arbitrary HTTP integrations and a third-party module marketplace. It also excludes song covers: voice input uses ASR and spoken replies use TTS.
 
 ## Current state
 
@@ -22,15 +22,15 @@ cargo build --release
 Create a configuration and check it:
 
 ```powershell
-.\target\release\aurabot.exe init
+.\target\release\dfybot.exe init
 ```
 
 Edit `config.toml`. Set the model API key as an environment variable. Start in dry-run mode; it records the would-be response and sends nothing:
 
 ```powershell
 $env:AURABOT_MODEL_KEY = "your-model-api-key"
-.\target\release\aurabot.exe check
-.\target\release\aurabot.exe serve
+.\target\release\dfybot.exe check
+.\target\release\dfybot.exe serve
 ```
 
 Open `http://127.0.0.1:8787`. On first start a random management token is written to `data/admin.token`; enter it in the panel. The server listens on loopback by default. To receive QQ Open Platform Webhook events from the internet, set `server.listen` to a public interface and put TLS and authentication for remote panel access at a reverse proxy. Keep the management API behind the proxy's authentication policy too. Alternatively use the official WebSocket transport, which only requires outbound network access.
@@ -45,8 +45,8 @@ OneBot group and private chats, images, stickers and incoming audio records are 
 
 Create an official QQ bot and configure `official.app_id`, `official.secret_env`, and either:
 
-- `official.transport = "webhook"`: set the platform callback URL to `https://your-domain/official/webhook`, forward that path to Aurabot, and configure the server's public bind address. The adapter handles URL verification and verifies Ed25519 signatures before queueing events.
-- `official.transport = "websocket"`: Aurabot opens the official Gateway connection and reconnects after network failures.
+- `official.transport = "webhook"`: set the platform callback URL to `https://your-domain/official/webhook`, forward that path to dfyBOT, and configure the server's public bind address. The adapter handles URL verification and verifies Ed25519 signatures before queueing events.
+- `official.transport = "websocket"`: dfyBOT opens the official Gateway connection and reconnects after network failures.
 
 Put the App Secret in the named environment variable. Configure the platform IP allowlist and only subscribe to scenes/events the bot has actually been granted. The same API key environment rules apply to chat, ASR and TTS. Official voice replies currently require `voice.tts_format = "opus"`; media uploads are only implemented for group and C2C private replies. Unsupported scenes fall back to text.
 
@@ -77,8 +77,8 @@ Proactive chat is limited to configured owner private conversations. The panel s
 Build the optional floating desktop client separately from the server:
 
 ```powershell
-cargo build --release --features desktop-pet --bin aurabot-pet
-.\target\release\aurabot-pet.exe --server http://127.0.0.1:8788 --token-file data/admin.token
+cargo build --release --features desktop-pet --bin dfybot-pet
+.\target\release\dfybot-pet.exe --server http://127.0.0.1:8788 --token-file data/admin.token
 ```
 
 The client polls the authenticated `/api/pet/state` endpoint every three seconds and only receives aggregate owner-session mood/activity, not messages. Its six state animations use cropped frames from the user's installed Shenshen character; see [asset selection and license](assets/shenshen/README.md). Only the active animation's compressed frames and one texture are kept in memory; playback runs at 24 fps. Local HTTP is accepted only for loopback addresses; remote server URLs require HTTPS. The floating window is transparent, draggable and always on top. Right-click it to exit.

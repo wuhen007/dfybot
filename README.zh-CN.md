@@ -1,6 +1,6 @@
-# Aurabot Rust
+# dfyBOT
 
-Aurabot Rust 是一个独立运行的 QQ 机器人服务端，使用 Rust 编写，不依赖 DeepSeek Harness。OneBot v11 与 QQ 官方开放平台共用同一套聊天引擎、记忆和权限系统。
+dfyBOT 是一个独立运行的 QQ 机器人服务端，使用 Rust 编写，不依赖 DeepSeek Harness。OneBot v11 与 QQ 官方开放平台共用同一套聊天引擎、记忆和权限系统。
 
 现阶段支持聊天、逐会话中断、人格与心情、语音识别和语音回复、贴图、长期记忆、私聊主动对话、权限控制、网页管理面板和可选桌宠。QQ 空间、B 站、本地翻唱、图像生成、任意本地 HTTP 接口和第三方插件市场不在当前范围内。
 
@@ -16,15 +16,15 @@ cargo build --release
 初始化配置并检查：
 
 ```powershell
-.\target\release\aurabot.exe init
+.\target\release\dfybot.exe init
 ```
 
 编辑生成的 `config.toml`，设置模型服务的 API Key 环境变量，然后先用 dry-run 模式启动。dry-run 会记录预期回复，但不会发给 QQ 用户。
 
 ```powershell
 $env:AURABOT_MODEL_KEY = "你的模型 API Key"
-.\target\release\aurabot.exe check
-.\target\release\aurabot.exe serve
+.\target\release\dfybot.exe check
+.\target\release\dfybot.exe serve
 ```
 
 管理面板地址由 `server.listen` 决定。初始化生成的默认配置使用 `127.0.0.1:8787`；仓库内示例 `config.toml` 使用 `127.0.0.1:8788`。首次启动时，管理令牌会写入 `data/admin.token`；也可以通过 `AURABOT_ADMIN_TOKEN` 环境变量提供令牌。
@@ -76,8 +76,8 @@ ASR 和 TTS 使用 OpenAI 兼容接口。可通过 `voice.base_url`、`voice.asr
 桌宠是单独的可选程序，不会和服务端共用进程：
 
 ```powershell
-cargo build --release --features desktop-pet --bin aurabot-pet
-.\target\release\aurabot-pet.exe --server http://127.0.0.1:8788 --token-file data/admin.token
+cargo build --release --features desktop-pet --bin dfybot-pet
+.\target\release\dfybot-pet.exe --server http://127.0.0.1:8788 --token-file data/admin.token
 ```
 
 将示例中的端口替换为 `server.listen` 配置的实际端口。桌宠每 3 秒请求一次受令牌保护的 `/api/pet/state`，只接收主人会话的汇总心情和活动状态，不接收聊天内容。角色动画使用仓库内 Shenshen 素材，素材选择与许可记录见 [素材说明](assets/shenshen/README.md)。发布时请保留 `assets/shenshen` 目录结构和许可文件。

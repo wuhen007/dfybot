@@ -4,7 +4,7 @@ use std::{io::Write, path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
-#[command(name = "aurabot", version, about = "Standalone Rust QQ AI companion")]
+#[command(name = "dfybot", version, about = "dfyBOT standalone Rust QQ bot")]
 struct Cli {
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "aurabot=info,tower_http=warn".into()),
+                .unwrap_or_else(|_| "dfybot=info,tower_http=warn".into()),
         )
         .init();
     let cli = Cli::parse();
@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     match command {
         Command::Init => init(&cli.config),
         Command::Check => {
-            let c = aurabot::config::Config::load(&cli.config)?;
+            let c = dfybot::config::Config::load(&cli.config)?;
             println!(
                 "Configuration valid; OneBot={}, QQ official={}, voice={}",
                 c.onebot.enabled, c.official.enabled, c.voice.enabled
@@ -47,7 +47,7 @@ fn init(path: &std::path::Path) -> Result<()> {
     if let Some(p) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(p)?
     }
-    let text = toml::to_string_pretty(&aurabot::config::Config::default())?;
+    let text = toml::to_string_pretty(&dfybot::config::Config::default())?;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -60,31 +60,31 @@ fn init(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 async fn serve(path: PathBuf) -> Result<()> {
-    let cfg = aurabot::config::Config::load(&path)?;
+    let cfg = dfybot::config::Config::load(&path)?;
     let admin = admin_token(&cfg.server.data_dir, &cfg.server.admin_token_env)?;
     cfg.validate()?;
     let cfg = Arc::new(cfg);
     let db = PathBuf::from(&cfg.server.data_dir).join("aurabot.sqlite");
-    let store = aurabot::store::Store::open(&db)?;
-    let engine = aurabot::engine::Engine::new(cfg.clone(), store.clone())?;
+    let store = dfybot::store::Store::open(&db)?;
+    let engine = dfybot::engine::Engine::new(cfg.clone(), store.clone())?;
     engine.start_workers().await;
     let stop = CancellationToken::new();
-    let sched = tokio::spawn(aurabot::engine::run_scheduler(engine.clone(), stop.clone()));
+    let sched = tokio::spawn(dfybot::engine::run_scheduler(engine.clone(), stop.clone()));
     if cfg.onebot.enabled {
-        tokio::spawn(aurabot::adapters::onebot::run(cfg.clone(), engine.clone()));
+        tokio::spawn(dfybot::adapters::onebot::run(cfg.clone(), engine.clone()));
     }
     if cfg.official.enabled && cfg.official.transport == "websocket" {
-        tokio::spawn(aurabot::adapters::official::gateway(
+        tokio::spawn(dfybot::adapters::official::gateway(
             cfg.clone(),
             engine.clone(),
         ));
     }
-    let router = aurabot::http::router(engine, cfg.clone(), &admin);
+    let router = dfybot::http::router(engine, cfg.clone(), &admin);
     let addr: std::net::SocketAddr = cfg.server.listen.parse()?;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .context("bind server listener")?;
-    println!("Aurabot management panel: http://{addr}/");
+    println!("dfyBOT 管理面板: http://{addr}/");
     println!("Database: {}", db.display());
     if cfg.server.admin_token_env.is_empty() || std::env::var(&cfg.server.admin_token_env).is_err()
     {
